@@ -936,12 +936,13 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 
 
 def standard_arrow(q, u, off, ptk):
-    L = off * 1.25 * ptk
+    # Чуть длиннее стрелка → подпись дальше от линии, меньше наложений
+    L = off * 1.45 * ptk
     ux, uy = u
-    start = (q[0] + ux * L * 0.10, q[1] + uy * L * 0.10)
+    start = (q[0] + ux * L * 0.08, q[1] + uy * L * 0.08)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.34
-    wing = head * 0.42
+    head = L * 0.32
+    wing = head * 0.40
     px, py = -uy, ux
     a1 = (
         end[0] - ux * head + px * wing,
@@ -1091,27 +1092,51 @@ def make_flags(rows, txt, dxf, off):
             or sorted(g, key=pid_sort)[:1]
         )
 
-    ch = off * 0.70 * TEXT_SCALE
-    lw = ch * 0.95
-    vw = ch * 3.20
+    # Размеры подписи: чуть компактнее, больше зазор от стрелки
+    ch = off * 0.62 * TEXT_SCALE
+    lw = ch * 0.90
+    vw = ch * 2.90
     w = lw + vw
-    pad = ch * 0.12
-    gap = ch * 0.18
+    pad = ch * 0.22          # больший зазор между флагами
+    gap = ch * 0.32          # дальше от конца стрелки
 
-    micro_perp = [0.0, 0.55, -0.55, 1.10, -1.10, 1.65, -1.65]
-    micro_along = [0.0, 0.35, 0.70]
+    # Больше вариантов смещения — легче уйти от наложений
+    micro_perp = [0.0, 0.45, -0.45, 0.90, -0.90, 1.40, -1.40, 1.90, -1.90]
+    micro_along = [0.0, 0.30, 0.60, 0.95]
+
+    # --- лёгкое прореживание очень близких одиночных точек ---
+    # Если две одиночные подписи ближе 0.55*off и |Δ| почти одинаковый —
+    # оставляем ту, у которой |Δ| больше (или первую).
+    thinned: List[List[dict]] = []
+    used_q = []
+    for ordered in raw:
+        if len(ordered) > 1:          # пары В/Н не трогаем
+            thinned.append(ordered)
+            used_q.append(ordered[0]["q"])
+            continue
+        q = ordered[0]["q"]
+        dp = abs(ordered[0].get("dp", 0.0))
+        too_close = False
+        for prev_q, prev_dp in used_q:
+            if math.hypot(q[0] - prev_q[0], q[1] - prev_q[1]) < off * 0.55:
+                if abs(dp - prev_dp) < max(txt.red_mm * 0.4, 3.0):
+                    too_close = True
+                    break
+        if not too_close:
+            thinned.append(ordered)
+            used_q.append((q, dp))
 
     occupied = []
     flags = []
 
-    for ordered in raw:
+    for ordered in thinned:
         row0 = ordered[0]
         q = row0["q"]
         src_idx = _source_index(row0, dxf)
         u_real = offset_dir(ordered, dxf)
 
-        probe = max(off * 8.0, (w + 2.0 * ch) * 1.5)
-        near_segments = _near_segments(q, dxf, probe * 1.2)
+        probe = max(off * 9.0, (w + 2.5 * ch) * 1.6)
+        near_segments = _near_segments(q, dxf, probe * 1.25)
         dirs = _candidate_dirs(ordered, dxf)
 
         seg0 = _safe_segment(dxf, row0)
@@ -1128,7 +1153,7 @@ def make_flags(rows, txt, dxf, off):
             theta = text_angle(ordered, dxf, d)
             ar = standard_arrow(q, d, off, txt.pt_k)
 
-            row_h = ch * (2.0 if abs(theta) > 45.0 else 1.0)
+            row_h = ch * (1.85 if abs(theta) > 45.0 else 1.0)
             cnt = len(ordered)
             h = row_h * cnt
 
@@ -1138,16 +1163,11 @@ def make_flags(rows, txt, dxf, off):
                 bw, bh = w, h
 
             dir_clear = _direction_clearance(
-                q,
-                d,
-                near_segments,
-                off,
-                src_idx,
-                probe,
+                q, d, near_segments, off, src_idx, probe,
             )
 
-            real_bonus = 0.10 * off * (d[0] * u_real[0] + d[1] * u_real[1])
-            normal_bonus = 0.06 * off * abs(d[0] * n0[0] + d[1] * n0[1])
+            real_bonus = 0.14 * off * (d[0] * u_real[0] + d[1] * u_real[1])
+            normal_bonus = 0.08 * off * abs(d[0] * n0[0] + d[1] * n0[1])
 
             dx, dy = d
             px, py = -dy, dx
@@ -1177,20 +1197,17 @@ def make_flags(rows, txt, dxf, off):
                     )
 
                     box_clear = _box_clearance(
-                        cbox,
-                        q,
-                        near_segments,
-                        off,
-                        src_idx,
+                        cbox, q, near_segments, off, src_idx,
                     )
 
+                    # Сильнее наказываем пересечения — главная причина «каши»
                     score = (
                         dir_clear
-                        + 0.60 * box_clear
+                        + 0.70 * box_clear
                         + real_bonus
                         + normal_bonus
-                        - (abs(perp) * 0.05 + along * 0.08) * off
-                        - (8.0 * off if overlap else 0.0)
+                        - (abs(perp) * 0.04 + along * 0.06) * off
+                        - (18.0 * off if overlap else 0.0)
                     )
 
                     flag = {
@@ -1214,7 +1231,6 @@ def make_flags(rows, txt, dxf, off):
                         ],
                         "pair": len(ordered) > 1,
                     }
-
                     candidates.append((score, flag, overlap))
 
         free = [c for c in candidates if not c[2]]
@@ -1266,10 +1282,11 @@ def _text_path_cached(s: str):
 
 @lru_cache(maxsize=2048)
 def _flag_pair_cached(letter: str, val: str):
+    """Буква + цифра на одной базовой линии, небольшой стабильный зазор."""
     tl, x0l, wl, _hl = _text_path_cached(letter)
     tv, x0v, _wv, _hv = _text_path_cached(val)
 
-    gap = 0.42
+    gap = 0.38   # чуть плотнее, чтобы пара читалась как одно целое
 
     p_l = tl.transformed(Affine2D().translate(-x0l, 0.0))
     p_v = tv.transformed(Affine2D().translate(wl + gap - x0v, 0.0))
