@@ -27,7 +27,7 @@ from matplotlib import font_manager as fm
 import matplotlib as mpl
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN = ("BOT_TOKEN")
+BOT_TOKEN = ("9146933548:AAFtBnxiloEZSUicLF15CC73_2OOAr0DQbk")
 dp = Dispatcher(storage=MemoryStorage())
 
 
