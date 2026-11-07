@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os, re, math, shutil, tempfile, statistics, asyncio, logging
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -35,9 +36,13 @@ dp = Dispatcher(storage=MemoryStorage())
 # МОДУЛЬ 0. ПРОВЕРКА СК «TXT ↔ DXF» — ПЕРВЫМ после двух файлов
 # ═══════════════════════════════════════════════════════════════════════════
 
-NEAR_M = 5.0
-SWAP_RATIO = 3.0
-SHIFT_M = 50.0
+NEAR_M = 5.0          # «рядом»: медиана до ближайшего контура, м
+SWAP_RATIO = 3.0      # во сколько раз X↔Y должна улучшить
+SHIFT_M = 50.0        # выше → просим X0 Y0, НЕ авто-совмещение
+
+# ── ЛИМИТ ВХОДНОГО DXF ────────────────────────────────────────────────
+DXF_MAX_MB = 30
+DXF_MAX_BYTES = DXF_MAX_MB * 1024 * 1024        # 31 457 280 байт
 
 
 @dataclass
@@ -152,6 +157,16 @@ def md_code(s) -> str:
     return str(s).replace("`", "'").replace("\r", " ").replace("\n", " ")
 
 
+class FileTooBig(Exception):
+    def __init__(self, size: int, limit: int):
+        self.size, self.limit = size, limit
+        super().__init__(f"{size} > {limit}")
+
+
+def human_mb(n: int) -> str:
+    return f"{n / 1024 / 1024:.1f} МБ"
+
+
 PT_MIN, PT_MAX, PT_STEP = 0.40, 3.00, 0.25
 TEXT_SCALE = 2.0          # буквы и цифры ×2
 
@@ -200,12 +215,53 @@ def cyr_fp():
     return _FP_CACHE
 
 
+# ─────────── Имена выходных файлов ───────────
+
+def safe_basename(s, fallback="exec_plan") -> str:
+    """Безопасное базовое имя: кириллица/цифры/_-/. допустимы."""
+    s = str(s or "").strip()
+    s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE)
+    s = s.replace(" ", "_")
+    s = re.sub(r"_+", "_", s).strip("._-")
+    s = s[:64].strip("._-")
+    return s or fallback
+
+
+def auto_stem(data: dict) -> str:
+    """Авто: от имени TXT + _exec_plan, иначе по времени."""
+    raw = data.get("txt_name") or data.get("dxf_name") or ""
+    stem = Path(raw).stem if raw else ""
+    stem = safe_basename(stem, "")
+    if stem and stem.lower() not in ("points", "proj", "project", "plan"):
+        return safe_basename(f"{stem}_exec_plan")
+    return "exec_plan_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def out_stem(data: dict) -> str:
+    if data.get("name_mode") == "custom" and data.get("base_name"):
+        return safe_basename(data["base_name"])
+    return auto_stem(data)
+
+
+def name_label(data: dict) -> str:
+    return ("Авто" if data.get("name_mode", "auto") == "auto"
+            else safe_basename(data.get("base_name", ""), "своё"))
+
+
+def name_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 Авто", callback_data="auto_name"),
+         InlineKeyboardButton(text="↩️ К превью", callback_data="name_cancel")],
+    ])
+
+
 class Form(StatesGroup):
     wait_txt = State()
     wait_dxf = State()
     wait_shift = State()
     cs_check = State()
     preview = State()
+    wait_name = State()      # ждём имя файлов
     ready = State()
 
 
@@ -278,11 +334,11 @@ def parse_txt(path: str) -> TxtData:
 
         s = line.replace(";", " ").replace("\t", " ")
         if re.search(r"\s", s):
-            s = re.sub(r"(?<=\d),(?=\d)", ".", s)
-            s = s.replace(",", " ")
+            s = re.sub(r"(?<=\d),(?=\d)", ".", s)   # десятичная запятая → точка
+            s = s.replace(",", " ")                  # полевые запятые → пробел
             toks = s.split()
         else:
-            toks = s.split(",")
+            toks = s.split(",")                      # чистый экспорт тахеометра
 
         fields = [t.strip() for t in toks if t.strip()]
         if len(fields) < 4:
@@ -362,6 +418,7 @@ def max_gap_threshold(hs: List[float]) -> float:
 
 
 def assign_marks(rows, txt: TxtData, dxf) -> dict:
+    """В/Н — автоматически по H. ОДНА подпись на XY-грань."""
     for r in rows:
         r.pop("pair_key", None); r.pop("mark", None)
         r["in_flag"] = False
@@ -561,20 +618,15 @@ def geom_offset(dxf, rows):
     return off, off * 0.62 * TEXT_SCALE
 
 
-# ═══════════ НАПРАВЛЕНИЕ СМЕЩЕНИЯ u = normalize(P − Q) ═══════════
+# ═══════════ ТОНКАЯ ЧЁРНАЯ СТРЕЛКА Q(полилиния) → P(точка) ═══════════
 
 def offset_dir(rows_subset, dxf):
-    """
-    Единое направление: от ближайшей полилинии к фактической точке.
-    И красный луч, и подпись, и выноска ставятся ТОЛЬКО в эту сторону.
-    """
+    """Направление смещения — только чтобы положить текст рядом."""
     vx = sum(r["p"][0] - r["q"][0] for r in rows_subset)
     vy = sum(r["p"][1] - r["q"][1] for r in rows_subset)
     L = math.hypot(vx, vy)
     if L > 1e-9:
         return vx / L, vy / L
-
-    # Δ≈0: берём нормаль ребра, ориентированную по знаку dp
     s = dxf.segments[rows_subset[0]["si"]]
     ex, ey = s.bx - s.ax, s.by - s.ay
     el = math.hypot(ex, ey) or 1.0
@@ -584,27 +636,32 @@ def offset_dir(rows_subset, dxf):
     return nx, ny
 
 
-def offset_ray(r, off, ptk):
+def offset_arrow(r, off, ptk):
     """
-    Красный луч РЯДОМ С ТОЧКОЙ, в сторону смещения.
-    Без треугольника, без засечки у Q, без точки у Q — как на вложении.
+    Простая тонкая стрелочка: линия Q→P + два коротких усика у P.
+    Без заливки, без SOLID, без засечки у Q, без точки у Q.
     """
     x, y = r["p"]
     qx, qy = r["q"]
     dx, dy = x - qx, y - qy
     d = math.hypot(dx, dy)
     cr = off * 0.30 * ptk
-    if d < max(off * 0.06 * ptk, 1e-9):
+    if d < max(off * 0.05 * ptk, 1e-9):
         return None
+
     ux, uy = dx / d, dy / d
-    # чем больше отклонение, тем длиннее луч, но с потолком
-    L = min(max(d * 1.20, off * 1.40 * ptk), off * 6.00 * ptk)
-    start = (x + ux * cr * 0.55, y + uy * cr * 0.55)
-    end = (x + ux * L, y + uy * L)
-    return {"start": start, "end": end, "u": (ux, uy), "cr": cr, "d": d}
+    head = min(d * 0.45, off * 0.50 * ptk)
+    head = max(head, d * 0.18)
+    wing = head * 0.42
+    px, py = -uy, ux
+    a1 = (x - ux * head + px * wing, y - uy * head + py * wing)
+    a2 = (x - ux * head - px * wing, y - uy * head - py * wing)
+
+    return {"q": (qx, qy), "p": (x, y),
+            "a1": a1, "a2": a2, "cr": cr, "d": d}
 
 
-# ─────────── Подписи: ОДНА на грань, В СТОРОНУ СМЕЩЕНИЯ ───────────
+# ─────────── Подписи: ВПЛОТНУЮ к точке, БЕЗ выносок ───────────
 
 def make_flags(rows, txt, dxf, off):
     use = [r for r in rows if r.get("in_flag")]
@@ -622,25 +679,27 @@ def make_flags(rows, txt, dxf, off):
     lw = ch * 0.95                       # поле под букву
     vw = ch * 3.20                       # поле под отклонение
     w = lw + vw
-    diag = off * 0.85
-    lead0 = off * 2.2
-    step = ch * 1.30                     # сдвиг ТОЛЬКО вдоль луча
-    pad = ch * 0.22
+    gap = off * 0.55 + ch * 0.10         # ВПЛОТНУЮ
+    pad = ch * 0.12
+
+    # микро-разнос ТОЛЬКО по перпендикуляру, максимум ~1.65 высоты строки
+    micro = [(0.0, 0.0), (0.55, 0.0), (-0.55, 0.0),
+             (1.10, 0.0), (-1.10, 0.0),
+             (1.10, 0.25), (-1.10, 0.25), (1.65, 0.25), (-1.65, 0.25)]
 
     occupied, flags = [], []
     for ordered in raw:
         anchor = (sum(r["p"][0] for r in ordered) / len(ordered),
                   sum(r["p"][1] for r in ordered) / len(ordered))
         nx, ny = offset_dir(ordered, dxf)
-        elbow = (anchor[0] + nx * diag, anchor[1] + ny * diag)
+        px, py = -ny, nx
         h = ch * len(ordered)
 
         chosen = None
-        # тесно → отодвигаем подпись ДАЛЬШЕ В ТУ ЖЕ СТОРОНУ, не вбок
-        for k in range(12):
-            dlead = lead0 + k * step
-            bx = anchor[0] + nx * dlead - (w if nx < 0 else 0.0)
-            by = anchor[1] + ny * dlead * 0.35 - h / 2.0
+        for perp, along in micro:
+            d = gap + along * ch
+            bx = anchor[0] + nx * d + px * perp * ch - (w if nx < 0 else 0.0)
+            by = anchor[1] + ny * d * 0.35 + py * perp * ch - h / 2.0
             box = (bx, by, w, h)
             hit = any(not (box[0] + w + pad < b[0] or b[0] + b[2] + pad < box[0] or
                            box[1] + h + pad < b[1] or b[1] + b[3] + pad < box[1])
@@ -649,18 +708,13 @@ def make_flags(rows, txt, dxf, off):
                 chosen = box
                 break
         if chosen is None:
-            dlead = lead0 + 12 * step
-            chosen = (anchor[0] + nx * dlead - (w if nx < 0 else 0.0),
-                      anchor[1] + ny * dlead * 0.35 - h / 2.0, w, h)
+            bx = anchor[0] + nx * gap - (w if nx < 0 else 0.0)
+            by = anchor[1] + ny * gap * 0.35 - h / 2.0
+            chosen = (bx, by, w, h)
         occupied.append(chosen)
-        x0, y0, _, _ = chosen
-
-        polka = ((x0 if nx >= 0 else x0 + w), y0 + h / 2.0)
-        shelf = (polka[0] - nx * w * 0.16, polka[1])   # крючок ближе к точке
 
         flags.append({
-            "rows": ordered, "anchor": anchor, "elbow": elbow,
-            "shelf": shelf, "polka": polka,
+            "rows": ordered, "anchor": anchor,
             "box": chosen, "ch": ch, "cols": (lw, vw), "dir": (nx, ny),
             # НОМЕРА ТОЧКИ НЕТ: только буква и Δплан
             "lines": [(r["mark"] or "·", f"{r['dp']:+.0f}", r["over"])
@@ -701,40 +755,37 @@ def _new_fig():
 def render_scene(ax, dxf, rows, flags, txt):
     fp = cyr_fp()
     off, ptk = txt.off, txt.pt_k
-    INK, RED, LEAD = "#1a1a1a", "#cc0000", "#555555"
+    INK, RED = "#1a1a1a", "#cc0000"
 
     # 1) ТОЛЬКО тонкий серый контур проекта — без штриховки
     for pts, _, _ in dxf.polylines:
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
                 color="#7d7d7d", lw=0.55, zorder=1)
 
-    # 2) красный крестик + КРАСНЫЙ ЛУЧ В СТОРОНУ СМЕЩЕНИЯ (без наконечника)
+    # 2) ТОНКАЯ ЧЁРНАЯ СТРЕЛКА Q→P + красный крестик в P
     cr0 = off * 0.30 * ptk
     for r in rows:
         x, y = r["p"]
-        ray = offset_ray(r, off, ptk)
-        cr = ray["cr"] if ray else cr0
-        if ray:
-            (sx, sy), (ex, ey) = ray["start"], ray["end"]
-            ax.plot([sx, ex], [sy, ey], color=RED, lw=0.95,
-                    solid_capstyle="round", zorder=3)
-        ax.plot([x - cr, x + cr], [y, y], color=RED, lw=0.55, zorder=4)
-        ax.plot([x, x], [y - cr, y + cr], color=RED, lw=0.55, zorder=4)
+        ar = offset_arrow(r, off, ptk)
+        cr = ar["cr"] if ar else cr0
+        if ar:
+            qx, qy = ar["q"]
+            ax.plot([qx, x], [qy, y], color=INK, lw=0.30, zorder=2)
+            ax.plot([x, ar["a1"][0]], [y, ar["a1"][1]],
+                    color=INK, lw=0.30, zorder=2)
+            ax.plot([x, ar["a2"][0]], [y, ar["a2"][1]],
+                    color=INK, lw=0.30, zorder=2)
+        ax.plot([x - cr, x + cr], [y, y], color=RED, lw=0.55, zorder=3)
+        ax.plot([x, x], [y - cr, y + cr], color=RED, lw=0.55, zorder=3)
 
-    # 3) тонкая «клюшка» + КРУПНАЯ подпись в ТУ ЖЕ сторону
+    # 3) КРУПНАЯ подпись РЯДОМ — НИКАКИХ выносок, рамок, номеров, черты
     for f in flags:
-        a, e, sh, pk = f["anchor"], f["elbow"], f["shelf"], f["polka"]
-        ax.plot([a[0], e[0]], [a[1], e[1]], color=LEAD, lw=0.30, zorder=5)
-        ax.plot([e[0], sh[0]], [e[1], sh[1]], color=LEAD, lw=0.30, zorder=5)
-        ax.plot([sh[0], pk[0]], [sh[1], pk[1]], color=LEAD, lw=0.30, zorder=5)
-
         x0, y0, _, _ = f["box"]
         ch = f["ch"]; lw, vw = f["cols"]; cnt = len(f["lines"])
         for k, (letter, val, _over) in enumerate(f["lines"]):
             yy = y0 + (cnt - 1 - k) * ch
             data_text(ax, x0,      yy, letter, lw, ch, INK, fp)   # буква ×2
             data_text(ax, x0 + lw, yy, val,    vw, ch, RED, fp)   # цифры ×2
-            # КРАСНОЙ ЛИНИИ ПОД ЦИФРАМИ НЕТ
 
     ax.relim(); ax.autoscale_view()
     ax.set_aspect("equal", adjustable="datalim")
@@ -795,8 +846,8 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
     doc.header["$PDSIZE"] = off * 0.30 * txt.pt_k
     style = ensure_cyr_style(doc)
 
-    for name, color in (("PROJ", 8), ("FACT", 1), ("DELTA", 1),
-                        ("OVER", 1), ("TAG", 7), ("LEAD", 8)):
+    for name, color in (("PROJ", 8), ("FACT", 1), ("ARROW", 7),
+                        ("DELTA", 1), ("OVER", 1), ("TAG", 7)):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
     msp = doc.modelspace()
@@ -813,31 +864,24 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
     cr = off * 0.30 * txt.pt_k
     for r in rows:
         x, y = r["p"]
-        lay = "OVER" if r["over"] else "DELTA"
-
         msp.add_point((x, y), dxfattribs={"layer": "FACT"})
         msp.add_line((x - cr, y), (x + cr, y), dxfattribs={"layer": "FACT"})
         msp.add_line((x, y - cr), (x, y + cr), dxfattribs={"layer": "FACT"})
 
-        # красный луч от точки в сторону смещения — ОДНА линия, без SOLID/засечек
-        ray = offset_ray(r, off, txt.pt_k)
-        if ray:
-            msp.add_line(ray["start"], ray["end"],
-                         dxfattribs={"layer": lay, "lineweight": 35})
+        # тонкая чёрная стрелочка Q→P: 3 линии, без SOLID и без засечек
+        ar = offset_arrow(r, off, txt.pt_k)
+        if ar:
+            msp.add_line(ar["q"], ar["p"], dxfattribs={"layer": "ARROW"})
+            msp.add_line(ar["p"], ar["a1"], dxfattribs={"layer": "ARROW"})
+            msp.add_line(ar["p"], ar["a2"], dxfattribs={"layer": "ARROW"})
 
     ch = off * 0.62 * TEXT_SCALE           # ×2
     fs = ch * 0.55                         # ×2
     for f in flags:
-        a, e, sh, pk = f["anchor"], f["elbow"], f["shelf"], f["polka"]
-        msp.add_line(a, e, dxfattribs={"layer": "LEAD"})
-        msp.add_line(e, sh, dxfattribs={"layer": "LEAD"})
-        msp.add_line(sh, pk, dxfattribs={"layer": "LEAD"})
-
         x0, y0, _, _ = f["box"]
         lw, vw = f["cols"]; cnt = len(f["lines"])
 
-        # НИКАКОЙ рамки, НИКАКИХ перегородок, НИКАКОГО номера,
-        # НИКАКОГО подчёркивания под цифрами
+        # НИКАКИХ выносок, рамок, перегородок, номеров, подчёркиваний
         for k, (letter, val, _over) in enumerate(f["lines"]):
             yy = y0 + (cnt - 1 - k) * ch + ch * 0.20
             msp.add_text(letter, dxfattribs={
@@ -861,6 +905,7 @@ def load_inputs(data: dict):
     txt.pair_z = data.get("pair_z", txt.pair_z)
     txt.dxfunits = data.get("dxfunits", txt.dxfunits)
     txt.pt_k = clamp_pt(data.get("pt_k", txt.pt_k))
+    # МОДУЛЬ 0 решил → меняем ТОЛЬКО столбцы X/Y в TXT. H и SHIFT не трогаем.
     if data.get("swap_xy"):
         txt.points = [(pid, y, x, h) for pid, x, y, h in txt.points]
     dxf = parse_dxf(data["dxf_path"], txt.shift, txt.dxfunits, txt.level_tol)
@@ -887,10 +932,10 @@ def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
         f"*{marks['pairs']}*, одиночных — *{marks['alone']}*. Порог H "
         f"*{marks['thr']:+.3f}* ({marks['src']}). Вводить В/Н в TXT не надо.",
         f"Размер крестиков *{pt_label(txt.pt_k)}*; **буквы и цифры ×{TEXT_SCALE:.0f}**.",
-        "Оформление: тонкий серый контур **без штриховки**, красный крестик "
-        "и **красный луч от точки в сторону смещения** (без наконечника), "
-        "подпись `В  +25` / `Н  −20` **в ту же сторону**, тонкой клюшкой. "
-        "**Без рамки, без номера точки, без красной линии под цифрами.** "
+        "Оформление: тонкий серый контур **без штриховки**, красный крестик, "
+        "**тонкая чёрная стрелочка от полилинии к точке** (линия + два усика), "
+        "подпись `В  +25` / `Н  −20` **вплотную к точке**. "
+        "**Выносок нет. Рамки, номера точки и красной черты под цифрами нет.** "
         "Одна подпись на грань. Только плановые смещения, мм.",
         "`+` = слева по обходу полилинии, `−` = справа. Вне допуска — только "
         "❗ здесь, на листе ничем не выделяется. Легенды, штампа и рамки нет.",
@@ -918,14 +963,18 @@ def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
     return "\n".join(head)
 
 
-def preview_caption(txt, dxf, rows, flags, marks, swapped=False, warn=""):
+def preview_caption(txt, dxf, rows, flags, marks,
+                    swapped=False, warn="", stem="", name_mode="auto"):
     npair = sum(1 for f in flags if f["pair"])
+    mode = "*Авто*" if name_mode == "auto" else "*своё*"
     return (
         f"🖼 *PNG-превью* (до сборки файлов)\n"
         f"Точек *{len(rows)}*, подписей *{len(flags)}* (пар В/Н — *{npair}*).\n"
-        f"Красный луч и подпись `В +25` / `Н −20` ставятся **в одну сторону** "
-        f"от точки — по `P−Q`. Текст ×{TEXT_SCALE:.0f}, без рамки, без номера, "
-        f"без линии под цифрами.\n"
+        f"Тонкая чёрная стрелка `Q→P` у самой точки; подпись `В +25` / "
+        f"`Н −20` **рядом, без выноски**. Текст ×{TEXT_SCALE:.0f}, без рамки, "
+        f"без номера, без черты под цифрами.\n"
+        f"📁 Имя файлов: {mode} → `{md_code(stem)}.dxf` / `{md_code(stem)}.pdf`. "
+        "Кнопка *📝 Имя* задаёт своё, *🤖 Авто* возвращает авто.\n"
         f"СК: *{'🔄 X↔Y' if swapped else 'без перестановки'}*. "
         f"В/Н автоматически, порог H *{marks['thr']:+.3f}*.\n"
         f"Крестики *{pt_label(txt.pt_k)}* — кнопки перерисуют превью, "
@@ -937,9 +986,10 @@ def preview_caption(txt, dxf, rows, flags, marks, swapped=False, warn=""):
 def sample_caption(ptk):
     return (
         "📐 *Образец*: тонкий серый контур без штриховки, красный крестик, "
-        "**красный луч от точки в сторону смещения** (без треугольника) "
-        "и крупная подпись `В  +25` / `Н  −20` **в ту же сторону**.\n"
-        "Нет рамки, нет номера точки, нет красной черты под цифрами. "
+        "**тонкая чёрная стрелочка от кромки полилинии к точке** "
+        "(линия + два маленьких усика) и подпись `В  +25` / `Н  −20` "
+        "**вплотную к точке, без выноски**.\n"
+        "Нет рамки, номера точки, красной черты под цифрами. "
         f"Буквы и цифры ×{TEXT_SCALE:.0f}. `В/Н` приложение ставит само по `H`.\n\n"
         f"Размер крестиков *{pt_label(ptk)}* — кнопками *до* ввода файлов; "
         "уйдёт в DXF (`$PDSIZE`), PDF и PNG. Подписи от этого не меняются."
@@ -955,11 +1005,16 @@ def sample_kb(ptk):
     ])
 
 
-def preview_kb(ptk):
+def preview_kb(ptk, stem="", name_mode="auto"):
+    nm = "Авто" if name_mode == "auto" else (stem or "своё")
+    if len(nm) > 18:
+        nm = nm[:17] + "…"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➖ Точки", callback_data="pv_-"),
          InlineKeyboardButton(text=f"Точки {pt_label(ptk)}", callback_data="pv_info"),
          InlineKeyboardButton(text="➕ Точки", callback_data="pv_+")],
+        [InlineKeyboardButton(text=f"📝 Имя: {nm}", callback_data="ask_name"),
+         InlineKeyboardButton(text="🤖 Авто", callback_data="auto_name")],
         [InlineKeyboardButton(text="✅ Собрать DXF + PDF", callback_data="pv_build")],
         [InlineKeyboardButton(text="🔁 Перепроверить СК", callback_data="cs_recheck"),
          InlineKeyboardButton(text="🔄 Новые файлы", callback_data="pv_restart")],
@@ -967,17 +1022,42 @@ def preview_kb(ptk):
 
 
 def final_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📐 DXF", callback_data="get_dxf"),
-        InlineKeyboardButton(text="📄 PDF", callback_data="get_pdf"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📐 DXF", callback_data="get_dxf"),
+         InlineKeyboardButton(text="📄 PDF", callback_data="get_pdf")],
+        [InlineKeyboardButton(text="▶️ Продолжим новый файл",
+                              callback_data="pv_restart")],
+    ])
 
 
 # ─────────────────────────── Бот ───────────────────────────
 
-async def download_doc(msg: types.Message, dest: str):
+async def download_doc(msg: types.Message, dest: str, max_bytes: Optional[int] = None):
+    """
+    Скачивает документ в `<dest>.part`, проверяет размер ДО и ПОСЛЕ,
+    только потом atomically подменяет dest. Для DXF передаём max_bytes.
+    """
     f = await msg.bot.get_file(msg.document.file_id)
-    await msg.bot.download_file(f.file_path, dest)
+    declared = (msg.document.file_size
+                or getattr(f, "file_size", None)
+                or 0)
+    if max_bytes and declared > max_bytes:
+        raise FileTooBig(int(declared), max_bytes)
+
+    part = dest + ".part"
+    try:
+        await msg.bot.download_file(f.file_path, part)
+        real = os.path.getsize(part)
+        if max_bytes and real > max_bytes:
+            raise FileTooBig(real, max_bytes)
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+    return dest
 
 
 def edit_photo(path, caption):
@@ -995,8 +1075,12 @@ async def start(msg: types.Message, state: FSMContext):
 
     tmp = tempfile.mkdtemp(prefix=f"tg_{msg.from_user.id}_")
     ptk = 1.0
-    await state.update_data(tmp=tmp, shift=(0.0, 0.0), shift_checked=False,
-                            pt_k=ptk, swap_xy=False, cs_done=False)
+    await state.update_data(
+        tmp=tmp, shift=(0.0, 0.0), shift_checked=False,
+        pt_k=ptk, swap_xy=False, cs_done=False,
+        txt_name=None, dxf_name=None,
+        base_name=None, name_mode="auto",
+    )
     await state.set_state(Form.wait_txt)
 
     sample = os.path.join(tmp, "sample.png")
@@ -1012,9 +1096,15 @@ async def start(msg: types.Message, state: FSMContext):
         "`2,9500.9936,2867.6472,170.4933,,,,,,,,,,,`\n\n"
         "✅ **В/Н писать НЕ надо** — близкие по `XY` точки с `ΔH ≥ PAIRZ` "
         "→ пара, меньшая `H` = `Н`, большая = `В`. На грань — одна подпись.\n"
-        "🎯 Красный луч идёт **от крестика в сторону смещения точки от "
-        "ближайшей полилинии**; подпись `В +25` / `Н −20` ставится **туда же**. "
-        f"Без рамки, без номера, без штриховки, без черты под цифрами, текст ×{TEXT_SCALE:.0f}.\n"
+        "🎯 У самой точки: красный крестик и **тонкая чёрная стрелочка от "
+        "полилинии к точке**. Подпись `В +25` / `Н −20` стоит **вплотную**, "
+        f"**выносок нет**. Без рамки, номера, штриховки и черты под цифрами, "
+        f"текст ×{TEXT_SCALE:.0f}.\n"
+        f"⚠️ *DXF — не больше {DXF_MAX_MB} МБ* ({DXF_MAX_BYTES:,} байт). "
+        "Больший файл не скачиваю: удалите лишние слои/растр/блоки.\n"
+        "📁 В превью можно задать своё имя файлов (*📝 Имя*) или оставить "
+        "*🤖 Авто* — тогда возьму имя TXT + `_exec_plan`. "
+        "В конце будет *▶️ Продолжим новый файл*.\n"
         "✅ Хвост `,,,,`, десятичная точка, `;`, пробел, таб, запятая с "
         "пробелами и десятичная запятая — принимаются.\n"
         "⚠️ Не разбивайте число пробелом и не пишите `9505,1690,2865,1403` "
@@ -1028,7 +1118,7 @@ async def start(msg: types.Message, state: FSMContext):
         "`# TOL=10` — допуск плана, мм\n"
         "`# PAIRR=0.30`, `# PAIRZ=0.50` — пара по XY и по ΔH\n"
         "`# LEVELTOL=0.05` — привязка контура по Z\n"
-        "`# PTS=1.25` — размер крестиков/лучей (или кнопки выше)\n\n"
+        "`# PTS=1.25` — размер крестиков/стрелок (или кнопки выше)\n\n"
         "Затем *DXF* → проверка СК → PNG-превью → *✅ Собрать* → **DXF + PDF**.",
         parse_mode=ParseMode.MARKDOWN)
 
@@ -1038,6 +1128,7 @@ async def on_txt(msg: types.Message, state: FSMContext):
     if not (msg.document.file_name or "").lower().endswith(".txt"):
         await msg.answer("Нужен файл `.txt`.", parse_mode=ParseMode.MARKDOWN)
         return
+    fname = msg.document.file_name or "points.txt"
     data = await state.get_data()
     p = os.path.join(data["tmp"], "points.txt")
     await download_doc(msg, p)
@@ -1049,16 +1140,18 @@ async def on_txt(msg: types.Message, state: FSMContext):
     pt_k = txt.pt_k if txt.pt_set else data.get("pt_k", txt.pt_k)
     hs = [t[3] for t in txt.points]
     await state.update_data(
-        txt_path=p, shift=txt.shift, tol=txt.tol_mm,
+        txt_path=p, txt_name=fname,
+        shift=txt.shift, tol=txt.tol_mm,
         level_tol=txt.level_tol, pair_r=txt.pair_r, pair_z=txt.pair_z,
         dxfunits=txt.dxfunits, pt_k=pt_k,
-        shift_checked=False, swap_xy=False, cs_done=False)
+        shift_checked=False, swap_xy=False, cs_done=False,
+        base_name=None, name_mode="auto")
     await state.set_state(Form.wait_dxf)
     await msg.answer(
         f"TXT принят: точек *{len(txt.points)}*, H *{min(hs):.3f}…{max(hs):.3f}*, "
         f"допуск *{txt.tol_mm:.0f} мм*, PAIRZ *{txt.pair_z:.2f} м*, "
-        f"крестики *{pt_label(pt_k)}*, подписи ×{TEXT_SCALE:.0f} в сторону смещения.\n"
-        "Пришлите *DXF*.",
+        f"крестики *{pt_label(pt_k)}*, подписи ×{TEXT_SCALE:.0f} вплотную.\n"
+        f"Пришлите *DXF* (до *{DXF_MAX_MB} МБ*).",
         parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1073,10 +1166,42 @@ async def on_dxf(msg: types.Message, state: FSMContext):
     if not (msg.document.file_name or "").lower().endswith(".dxf"):
         await msg.answer("Нужен файл `.dxf`.", parse_mode=ParseMode.MARKDOWN)
         return
+
+    fname = msg.document.file_name or "proj.dxf"
     data = await state.get_data()
     p = os.path.join(data["tmp"], "proj.dxf")
-    await download_doc(msg, p)
-    await state.update_data(dxf_path=p, shift_checked=False,
+
+    # ── ЛИМИТ 30 МБ: до скачивания, по getFile и после скачивания ──
+    declared = msg.document.file_size
+    if declared and declared > DXF_MAX_BYTES:
+        await msg.answer(
+            f"⚠️ DXF слишком большой: *{human_mb(int(declared))}*.\n"
+            f"Лимит — *{DXF_MAX_MB} МБ* ({DXF_MAX_BYTES:,} байт). "
+            "Удалите лишние слои / растр / неиспользуемые блоки и пришлите "
+            "файл поменьше. Состояние не сброшено — жду DXF.",
+            parse_mode=ParseMode.MARKDOWN)
+        await state.set_state(Form.wait_dxf)
+        return
+
+    try:
+        await download_doc(msg, p, DXF_MAX_BYTES)
+    except FileTooBig as e:
+        await msg.answer(
+            f"⚠️ DXF слишком большой: *{human_mb(e.size)}* "
+            f"(фактический размер после загрузки).\n"
+            f"Лимит — *{DXF_MAX_MB} МБ* ({DXF_MAX_BYTES:,} байт). "
+            "Файл не принят, старый валидный DXF не испорчен. Пришлите поменьше.",
+            parse_mode=ParseMode.MARKDOWN)
+        await state.set_state(Form.wait_dxf)
+        return
+    except Exception as e:
+        await msg.answer(f"Не удалось скачать DXF: `{md_code(e)}`. Пришлите ещё раз.",
+                         parse_mode=ParseMode.MARKDOWN)
+        await state.set_state(Form.wait_dxf)
+        return
+
+    await state.update_data(dxf_path=p, dxf_name=fname,
+                            shift_checked=False,
                             swap_xy=False, cs_done=False)
     await msg.answer("DXF принят. Сначала *Модуль 0*: сверяю СК…")
     await run_cs_check(msg, state)
@@ -1084,8 +1209,10 @@ async def on_dxf(msg: types.Message, state: FSMContext):
 
 @dp.message(Form.wait_dxf)
 async def need_dxf(msg: types.Message):
-    await msg.answer("Пришлите файл `.dxf` с полилиниями проекта.",
-                     parse_mode=ParseMode.MARKDOWN)
+    await msg.answer(
+        f"Пришлите файл `.dxf` с полилиниями проекта "
+        f"(не больше *{DXF_MAX_MB} МБ*).",
+        parse_mode=ParseMode.MARKDOWN)
 
 
 @dp.message(Form.wait_shift, F.text)
@@ -1129,7 +1256,7 @@ async def in_cs_check(msg: types.Message):
 @dp.message(Form.preview)
 async def in_preview(msg: types.Message):
     await msg.answer("Превью выше 👆 *✅ Собрать DXF + PDF*, "
-                     "*🔁 Перепроверить СК* или /start.",
+                     "*📝 Имя*, *🔁 Перепроверить СК* или /start.",
                      parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1195,6 +1322,80 @@ async def cs_recheck(c: types.CallbackQuery, state: FSMContext):
     await run_cs_check(c.message, state, force=True)
 
 
+# ─────────── Имя файлов: своё / авто ───────────
+
+@dp.callback_query(F.data == "ask_name")
+async def ask_name(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if not d.get("txt_path") or not d.get("dxf_path"):
+        await c.answer("Сначала пришлите TXT и DXF", show_alert=True)
+        return
+    cur = name_label(d)
+    await state.set_state(Form.wait_name)
+    await c.message.answer(
+        "Пришлите *базовое имя* файлов одним сообщением — "
+        "сделаю `<имя>.dxf` и `<имя>.pdf`.\n"
+        f"Сейчас: `{md_code(cur)}`.\n"
+        "Разрешены буквы, цифры, `_`, `-`, `.`; лишнее заменю на `_`. "
+        "Или нажмите *🤖 Авто*.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=name_kb())
+    await c.answer()
+
+
+@dp.callback_query(F.data == "auto_name")
+async def auto_name(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if not d.get("txt_path") or not d.get("dxf_path"):
+        await c.answer("Сначала пришлите TXT и DXF", show_alert=True)
+        return
+    await state.update_data(base_name=None, name_mode="auto")
+    await state.set_state(Form.preview)
+    await c.answer("Авто-имя включено")
+    # редактируем то же превью, без дубликата
+    await make_preview(c.message, state, edit=True)
+
+
+@dp.callback_query(F.data == "name_cancel")
+async def name_cancel(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    await state.set_state(Form.preview if d.get("txt_path") else Form.wait_txt)
+    await c.answer("Оставил текущее имя")
+
+
+@dp.message(Form.wait_name, F.text)
+async def on_name(msg: types.Message, state: FSMContext):
+    t = msg.text.strip()
+    d = await state.get_data()
+    if not d.get("txt_path") or not d.get("dxf_path"):
+        await msg.answer("Файлы не найдены — нажмите /start и пришлите заново.")
+        await state.set_state(Form.wait_txt)
+        return
+
+    if t.lower() in ("авто", "auto", "🤖 авто"):
+        await state.update_data(base_name=None, name_mode="auto")
+        await msg.answer("Имя файлов: *Авто* ✅", parse_mode=ParseMode.MARKDOWN)
+    else:
+        base = safe_basename(t)
+        if not base:
+            await msg.answer("Не понял имя. Пришлите буквы/цифры или нажмите «🤖 Авто».",
+                             reply_markup=name_kb())
+            return
+        await state.update_data(base_name=base, name_mode="custom")
+        await msg.answer(
+            f"Имя файлов: `{md_code(base)}` → `{md_code(base)}.dxf`, "
+            f"`{md_code(base)}.pdf`.",
+            parse_mode=ParseMode.MARKDOWN)
+
+    # текстовое сообщение нельзя edit_media → шлём обновлённое превью
+    await make_preview(msg, state)
+
+
+@dp.message(Form.wait_name)
+async def need_name(msg: types.Message):
+    await msg.answer("Пришлите имя текстом или нажмите «🤖 Авто».",
+                     reply_markup=name_kb())
+
+
 # ─────────── Превью и сборка ───────────
 
 def _med_warn(data, rows) -> str:
@@ -1205,7 +1406,7 @@ def _med_warn(data, rows) -> str:
     return ""
 
 
-async def make_preview(msg: types.Message, state: FSMContext):
+async def make_preview(msg: types.Message, state: FSMContext, edit: bool = False):
     data = await state.get_data()
     try:
         txt, dxf, rows, off, th, flags, marks = build_scene(data)
@@ -1214,6 +1415,7 @@ async def make_preview(msg: types.Message, state: FSMContext):
                          parse_mode=ParseMode.MARKDOWN)
         await state.set_state(Form.wait_dxf)
         return
+
     med = statistics.median(r["d_m"] for r in rows)
     if med > SHIFT_M and not data.get("shift_checked"):
         await state.update_data(shift_checked=True, cs_done=False)
@@ -1224,35 +1426,58 @@ async def make_preview(msg: types.Message, state: FSMContext):
             "Авто-центрирование не делаю: обнулило бы отклонение.",
             parse_mode=ParseMode.MARKDOWN, reply_markup=recheck_kb())
         return
-    png = os.path.join(data["tmp"], "preview.png")
+
+    d2 = await state.get_data()
+    stem = out_stem(d2)
+    name_mode = d2.get("name_mode", "auto")
+    caption = preview_caption(
+        txt, dxf, rows, flags, marks,
+        swapped=bool(d2.get("swap_xy")),
+        warn=_med_warn(d2, rows),
+        stem=stem, name_mode=name_mode)
+    kb = preview_kb(txt.pt_k, stem, name_mode)
+
+    png = os.path.join(d2["tmp"], "preview.png")
     write_png(png, dxf, rows, flags, txt)
     await state.update_data(out_png=png, pt_k=txt.pt_k)
     await state.set_state(Form.preview)
-    await msg.answer_photo(
-        FSInputFile(png),
-        caption=preview_caption(txt, dxf, rows, flags, marks,
-                                swapped=bool(data.get("swap_xy")),
-                                warn=_med_warn(data, rows)),
-        parse_mode=ParseMode.MARKDOWN, reply_markup=preview_kb(txt.pt_k))
+
+    if edit:
+        try:
+            await msg.edit_media(media=edit_photo(png, caption), reply_markup=kb)
+            return
+        except Exception:
+            pass  # сообщение без медиа / старое — шлём новое
+
+    await msg.answer_photo(FSInputFile(png), caption=caption,
+                           parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 
 async def rerender_preview(c: types.CallbackQuery, state: FSMContext, delta: float):
     data = await state.get_data()
     ptk = clamp_pt(data.get("pt_k", 1.0) + delta)
     await state.update_data(pt_k=ptk)
+
+    d2 = await state.get_data()
     try:
-        txt, dxf, rows, off, th, flags, marks = build_scene(await state.get_data())
+        txt, dxf, rows, off, th, flags, marks = build_scene(d2)
     except Exception as e:
-        await c.answer(f"Ошибка: {md_code(e)}", show_alert=True)
+        await c.answer(f"Ошибка: `{md_code(e)}`", show_alert=True)
         return
-    png = os.path.join(data["tmp"], "preview.png")
+
+    stem = out_stem(d2)
+    name_mode = d2.get("name_mode", "auto")
+    png = os.path.join(d2["tmp"], "preview.png")
     write_png(png, dxf, rows, flags, txt)
     await state.update_data(out_png=png)
+
     await c.message.edit_media(
         media=edit_photo(png, preview_caption(
             txt, dxf, rows, flags, marks,
-            swapped=bool(data.get("swap_xy")), warn=_med_warn(data, rows))),
-        reply_markup=preview_kb(txt.pt_k))
+            swapped=bool(d2.get("swap_xy")),
+            warn=_med_warn(d2, rows),
+            stem=stem, name_mode=name_mode)),
+        reply_markup=preview_kb(txt.pt_k, stem, name_mode))
     await c.answer(f"Размер крестиков: {pt_label(txt.pt_k)}")
 
 
@@ -1291,12 +1516,13 @@ async def pv_plus(c: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "pv_info")
 async def pv_info(c: types.CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    await c.answer(f"Крестики/лучи {pt_label(d.get('pt_k', 1.0))}: $PDSIZE в DXF. "
+    await c.answer(f"Крестики/стрелки {pt_label(d.get('pt_k', 1.0))}: $PDSIZE в DXF. "
                    "Подписи от этого не меняются.")
 
 
 @dp.callback_query(F.data == "pv_restart")
 async def pv_restart(c: types.CallbackQuery, state: FSMContext):
+    """▶️ Продолжим новый файл / 🔄 Новые файлы → полный /start заново."""
     await c.answer("Начинаем заново")
     await start(c.message, state)
 
@@ -1310,24 +1536,35 @@ async def pv_build(c: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         await c.message.answer(f"Ошибка: `{md_code(e)}`", parse_mode=ParseMode.MARKDOWN)
         return
-    out_dxf = os.path.join(data["tmp"], "exec_plan.dxf")
-    out_pdf = os.path.join(data["tmp"], "exec_plan.pdf")
+
+    stem = out_stem(data)
+    name_mode = data.get("name_mode", "auto")
+    out_dxf = os.path.join(data["tmp"], f"{stem}.dxf")
+    out_pdf = os.path.join(data["tmp"], f"{stem}.pdf")
+
     write_dxf(out_dxf, dxf, rows, flags, off, th, txt)
     write_pdf(out_pdf, dxf, rows, flags, txt)
+
     await state.update_data(out_dxf=out_dxf, out_pdf=out_pdf)
     await state.set_state(Form.ready)
-    await c.message.answer(
-        make_head(txt, dxf, rows, flags, marks,
-                  swapped=bool(data.get("swap_xy")), warn=_med_warn(data, rows)),
-        parse_mode=ParseMode.MARKDOWN)
+
+    head_txt = make_head(
+        txt, dxf, rows, flags, marks,
+        swapped=bool(data.get("swap_xy")), warn=_med_warn(data, rows))
+    head_txt += (
+        f"\n📁 Имя файлов: *{'Авто' if name_mode == 'auto' else 'своё'}* → "
+        f"`{md_code(stem)}.dxf`, `{md_code(stem)}.pdf`."
+    )
+
+    await c.message.answer(head_txt, parse_mode=ParseMode.MARKDOWN)
     await c.message.answer_document(
-        FSInputFile(out_dxf),
-        caption=f"DXF: PROJ / FACT / DELTA / TAG / LEAD, метры, $INSUNITS=6, "
-                f"лучи по P−Q, подписи ×{TEXT_SCALE:.0f} без рамки")
+        FSInputFile(out_dxf, filename=f"{stem}.dxf"),
+        caption=f"{stem}.dxf — PROJ / FACT / ARROW / TAG, метры, "
+                f"$INSUNITS=6, стрелки Q→P, подписи ×{TEXT_SCALE:.0f} вплотную")
     await c.message.answer_document(
-        FSInputFile(out_pdf),
-        caption=f"PDF — луч и `В +25` / `Н −20` в одну сторону, "
-                f"×{TEXT_SCALE:.0f}, зум в Telegram",
+        FSInputFile(out_pdf, filename=f"{stem}.pdf"),
+        caption=f"{stem}.pdf — чёрная стрелка у точки и `В +25` / `Н −20` "
+                f"рядом, ×{TEXT_SCALE:.0f}, зум в Telegram",
         reply_markup=final_kb())
 
 
@@ -1339,7 +1576,10 @@ async def on_get(c: types.CallbackQuery, state: FSMContext):
     if not p or not os.path.exists(p):
         await c.answer("Файлы устарели, нажмите /start", show_alert=True)
         return
-    await c.message.answer_document(FSInputFile(p), caption=caps[c.data])
+    await c.message.answer_document(
+        FSInputFile(p, filename=os.path.basename(p)),
+        caption=f"{caps[c.data]}: {os.path.basename(p)}",
+        reply_markup=final_kb())
     await c.answer()
 
 
