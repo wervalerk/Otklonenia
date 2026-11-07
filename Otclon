@@ -42,7 +42,7 @@ SWAP_RATIO = 3.0
 SHIFT_M = 50.0
 
 DXF_MAX_MB = 30
-DXF_MAX_BYTES = DXF_MAX_MB * 1024 * 1024
+DXF_MAX_BYTES = DXF_MAX_MB * 1024 * 1024  # 31 457 280 байт
 
 
 @dataclass
@@ -246,6 +246,13 @@ def ensure_cyr_style(doc) -> str:
     except Exception:
         pass
     return "CYR"
+
+
+def ensure_layer(doc, name: str, color: int = 7) -> str:
+    """Гарантированно создаёт слой DXF, если его ещё нет."""
+    if name not in doc.layers:
+        doc.layers.add(name, color=color)
+    return name
 
 
 _FP_CACHE = None
@@ -953,8 +960,6 @@ def standard_arrow(q, u, off, ptk):
     }
 
 
-# ── Выбор более свободной стороны ──
-
 def _add_unique_dir(dirs, d):
     L = math.hypot(d[0], d[1])
     if L <= 1e-9:
@@ -967,13 +972,6 @@ def _add_unique_dir(dirs, d):
 
 
 def _candidate_dirs(ordered, dxf):
-    """
-    Кандидаты для размещения подписи:
-      • фактическая сторона смещения;
-      • противоположная сторона;
-      • обе нормали к исходной полилинии;
-      • касательные у углов.
-    """
     dirs = []
     u = offset_dir(ordered, dxf)
     _add_unique_dir(dirs, u)
@@ -1021,7 +1019,6 @@ def _point_clearance(x, y, q, near_segments, off, src_idx):
     for idx, s in near_segments:
         if idx == src_idx:
             continue
-        # локальные сегменты в самой точке Q не считаем препятствием
         if _seg_xy_dist(qx, qy, s) <= off * 0.20:
             continue
 
@@ -1035,10 +1032,6 @@ def _point_clearance(x, y, q, near_segments, off, src_idx):
 
 
 def _direction_clearance(q, d, near_segments, off, src_idx, probe):
-    """
-    Насколько свободно по лучу от исходной линии в выбранную сторону.
-    Чем больше результат, тем больше места.
-    """
     best = probe
     steps = 9
 
@@ -1105,7 +1098,6 @@ def make_flags(rows, txt, dxf, off):
     pad = ch * 0.12
     gap = ch * 0.18
 
-    # сдвиг поперёк и совсем немного вдоль выбранной стороны
     micro_perp = [0.0, 0.55, -0.55, 1.10, -1.10, 1.65, -1.65]
     micro_along = [0.0, 0.35, 0.70]
 
@@ -1122,7 +1114,6 @@ def make_flags(rows, txt, dxf, off):
         near_segments = _near_segments(q, dxf, probe * 1.2)
         dirs = _candidate_dirs(ordered, dxf)
 
-        # нормаль исходного сегмента — небольшой бонус «в сторону от линии»
         seg0 = _safe_segment(dxf, row0)
         if seg0 is None:
             n0 = (0.0, 1.0)
@@ -1155,10 +1146,7 @@ def make_flags(rows, txt, dxf, off):
                 probe,
             )
 
-            # бонус: чуть предпочитаем сторону фактического смещения
             real_bonus = 0.10 * off * (d[0] * u_real[0] + d[1] * u_real[1])
-
-            # бонус: чуть предпочитаем нормаль к линии, а не вдоль линии
             normal_bonus = 0.06 * off * abs(d[0] * n0[0] + d[1] * n0[1])
 
             dx, dy = d
@@ -1230,7 +1218,7 @@ def make_flags(rows, txt, dxf, off):
                     candidates.append((score, flag, overlap))
 
         free = [c for c in candidates if not c[2]]
-        best_score, best_flag, _ = max(
+        _best_score, best_flag, _overlap = max(
             free or candidates,
             key=lambda c: c[0],
         )
@@ -1559,16 +1547,17 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
 
     fact_aci = 1 if CROSS_COLOR == RED else 7
 
+    # ── слои: LEAD зарезервирован, чтобы будущие выноски не упали ──
     for name, color in (
         ("PROJ", 8),
         ("FACT", fact_aci),
         ("ARROW", 7),
+        ("LEAD", 8),
         ("DELTA", 7),
         ("OVER", 1),
         ("TAG", 7),
     ):
-        if name not in doc.layers:
-            doc.layers.add(name, color=color)
+        ensure_layer(doc, name, color)
 
     msp = doc.modelspace()
 
@@ -2554,6 +2543,7 @@ async def pv_build(c: types.CallbackQuery, state: FSMContext):
         swapped=bool(data.get("swap_xy")),
         warn=_med_warn(data, rows),
     )
+
     head_txt += (
         f"\n📁 Имя файлов: "
         f"*{'Авто' if name_mode == 'auto' else 'своё'}* → "
@@ -2565,22 +2555,27 @@ async def pv_build(c: types.CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    # ── ВАЖНО: caption — обычная строка, НЕ кортеж ──
+    dxf_caption = (
+        f"{stem}.dxf — PROJ / FACT / ARROW / LEAD / TAG, метры, "
+        "$INSUNITS=6, свободная сторона, текст ⟂ полилинии, "
+        f"красный только >{txt.red_mm:.0f} мм"
+    )
+
+    pdf_caption = (
+        f"{stem}.pdf — `В +25` / `Н +12` на одной базе, "
+        f"расстановка по свободной стороне, ×{TEXT_SCALE:.0f}, "
+        f"чёрное + красный >{txt.red_mm:.0f} мм"
+    )
+
     await c.message.answer_document(
         FSInputFile(out_dxf, filename=f"{stem}.dxf"),
-        caption=(
-            f"{stem}.dxf — PROJ / FACT / ARROW / TAG, метры, "
-            "$INSUNITS=6, свободная сторона, текст ⟂ полилинии, "
-            f"красный только >{txt.red_mm:.0f} мм"
-        ),
+        caption=dxf_caption,
     )
 
     await c.message.answer_document(
         FSInputFile(out_pdf, filename=f"{stem}.pdf"),
-        caption=(
-            f"{stem}.pdf — `В +25` / `Н +12` на одной базе, "
-            f"расстановка по свободной стороне, ×{TEXT_SCALE:.0f}, "
-            f"чёрное + красный >{txt.red_mm:.0f} мм"
-        ),
+        caption=pdf_caption,
         reply_markup=final_kb(),
     )
 
