@@ -20,14 +20,14 @@ from ezdxf.path import make_path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Polygon, Circle, PathPatch
+from matplotlib.patches import Polygon, Circle, PathPatch
 from matplotlib.textpath import TextPath
 from matplotlib.transforms import Affine2D
 from matplotlib import font_manager as fm
 import matplotlib as mpl
 
 logging.basicConfig(level=logging.INFO)
-BOT_TOKEN = ("9146933548:AAFtBnxiloEZSUicLF15CC73_2OOAr0DQbk")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 dp = Dispatcher(storage=MemoryStorage())
 
 
@@ -35,9 +35,9 @@ dp = Dispatcher(storage=MemoryStorage())
 # МОДУЛЬ 0. ПРОВЕРКА СК «TXT ↔ DXF» — ПЕРВЫМ после двух файлов
 # ═══════════════════════════════════════════════════════════════════════════
 
-NEAR_M = 5.0        # «рядом»: медиана до ближайшего контура, м
-SWAP_RATIO = 3.0    # во сколько раз X↔Y должна улучшить, чтобы предложить кнопку
-SHIFT_M = 50.0      # выше этого → просим X0 Y0 (привязку, НЕ авто-совмещение)
+NEAR_M = 5.0
+SWAP_RATIO = 3.0
+SHIFT_M = 50.0
 
 
 @dataclass
@@ -57,7 +57,6 @@ class CSReport:
 
 
 def _seg_xy_dist(px: float, py: float, s) -> float:
-    """Расстояние от точки до ОТРЕЗКА (с clamp t), только план, без Z."""
     ax, ay, bx, by = s.ax, s.ay, s.bx, s.by
     vx, vy = bx - ax, by - ay
     L2 = vx * vx + vy * vy
@@ -84,11 +83,6 @@ def _centroid_xy(points):
 
 
 def check_cs(txt_points, dxf_segments, shift=(0.0, 0.0)) -> CSReport:
-    """
-    A: TXT в текущей ориентации vs DXF+S
-    B: TXT с инвертированными X/Y   vs DXF+S
-    Меняем ТОЛЬКО столбцы X/Y в TXT, SHIFT один и тот же.
-    """
     direct_pts = [(x, y) for _, x, y, _ in txt_points]
     swap_pts = [(y, x) for _, x, y, _ in txt_points]
     dxf_pts = []
@@ -159,6 +153,7 @@ def md_code(s) -> str:
 
 
 PT_MIN, PT_MAX, PT_STEP = 0.40, 3.00, 0.25
+TEXT_SCALE = 2.0          # ← буквы и цифры отклонений в 2 раза крупнее
 
 
 def clamp_pt(v: float) -> float:
@@ -232,8 +227,6 @@ class TxtData:
     pair_r: float = 0.30
     pair_z: float = 0.50
     dxfunits: Optional[str] = None
-    flagbox: bool = True
-    hatch: bool = True          # зелёная штриховка тела, как на образце
     explicit: Dict[str, str] = field(default_factory=dict)
     pt_k: float = 1.0
     pt_set: bool = False
@@ -242,7 +235,7 @@ class TxtData:
 
 def parse_txt(path: str) -> TxtData:
     points, shift, tol, lvl, dxfunits = [], (0.0, 0.0), 10.0, 0.05, None
-    pair_r, pair_z, flagbox, hatch, txt_units = 0.30, 0.50, True, True, "m"
+    pair_r, pair_z, txt_units = 0.30, 0.50, "m"
     pt_k, pt_set, explicit = 1.0, False, {}
 
     for raw in Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines():
@@ -271,12 +264,6 @@ def parse_txt(path: str) -> TxtData:
             m = re.match(r"#\s*(?:PTS|PTK|PT|POINTSIZE)\s*=\s*([\d.,]+)", line, re.I)
             if m:
                 pt_k, pt_set = num(m.group(1)), True; continue
-            m = re.match(r"#\s*FLAGBOX\s*=\s*(0|1|off|on)", line, re.I)
-            if m:
-                flagbox = m.group(1).lower() in ("1", "on"); continue
-            m = re.match(r"#\s*HATCH\s*=\s*(0|1|off|on)", line, re.I)
-            if m:
-                hatch = m.group(1).lower() in ("1", "on"); continue
             m = re.match(r"#\s*DXFUNITS\s*=\s*(mm|cm|m)\b", line, re.I)
             if m:
                 dxfunits = m.group(1).lower(); continue
@@ -323,12 +310,15 @@ def parse_txt(path: str) -> TxtData:
 
     if not points:
         raise ValueError("В TXT нет ни одной точки.")
-    return TxtData(points, shift, tol, lvl, max(pair_r, 1e-6),
-                   max(pair_z, 1e-6), dxfunits, flagbox, hatch, explicit,
-                   clamp_pt(pt_k), pt_set)
+    return TxtData(
+        points=points, shift=shift, tol_mm=tol, level_tol=lvl,
+        pair_r=max(pair_r, 1e-6), pair_z=max(pair_z, 1e-6),
+        dxfunits=dxfunits, explicit=explicit,
+        pt_k=clamp_pt(pt_k), pt_set=pt_set,
+    )
 
 
-# ─────────────── Яруса: В/Н + ОДНА плашка на грань ───────────────
+# ─────────────── Яруса: В/Н + ОДНА подпись на грань ───────────────
 
 def cluster_levels(values, tol: float) -> List[float]:
     vals = sorted(v for v in values if math.isfinite(v))
@@ -373,9 +363,9 @@ def max_gap_threshold(hs: List[float]) -> float:
 
 def assign_marks(rows, txt: TxtData, dxf) -> dict:
     """
-    В/Н — автоматически по H. И, главное, ОДНА плашка на XY-грань:
-    в неё идут min H (Н) и max H (В); остальные точки группы остаются
-    на схеме крестиками, но прямоугольника не получают.
+    В/Н — автоматически по H. ОДНА подпись на XY-грань:
+    в неё идут min H (Н) и max H (В); остальные точки остаются
+    крестиками со стрелками, но подписи не получают.
     """
     for r in rows:
         r.pop("pair_key", None); r.pop("mark", None)
@@ -392,7 +382,7 @@ def assign_marks(rows, txt: TxtData, dxf) -> dict:
             lo["in_flag"] = hi["in_flag"] = True
             mids.append((lo["h"] + hi["h"]) / 2.0)
         else:
-            min(g, key=pid_sort)["in_flag"] = True   # один представитель
+            min(g, key=pid_sort)["in_flag"] = True
 
     hs = [r["h"] for r in rows]
     if mids:
@@ -559,7 +549,7 @@ def compute(txt: TxtData, dxf: DxfData):
             "pid": pid, "p": (x, y), "q": (best["qx"], best["qy"]),
             "h": h, "qz": best["qz"], "dz": best["dz"],
             "d_m": best["d"], "dp": dp, "layer": best["layer"], "si": best["si"],
-            "over": abs(dp) > txt.tol_mm,          # ← только план
+            "over": abs(dp) > txt.tol_mm,
             "mismatch": bool(dxf.has_z and other and not any(
                 c["dz"] <= txt.level_tol for c in (same + other))),
         })
@@ -572,12 +562,11 @@ def geom_offset(dxf, rows):
     for pts, _, _ in dxf.polylines:
         xs += [p[0] for p in pts]; ys += [p[1] for p in pts]
     span = max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
-    # плашка соизмерима со стеной, а не шире неё
     off = min(max(span * 0.0030, 0.012), 0.20)
-    return off, off * 0.62
+    return off, off * 0.62 * TEXT_SCALE
 
 
-# ─────────── Флажки: ОДИН на грань + разнос по спирали ───────────
+# ─────────── Подписи: ОДНА на грань, БЕЗ рамки и БЕЗ номера ───────────
 
 def _centroid(dxf):
     xs = [p[0] for pts, _, _ in dxf.polylines for p in pts]
@@ -589,7 +578,7 @@ def leader_dir(rows_subset, dxf):
     vx = sum(r["p"][0] - r["q"][0] for r in rows_subset)
     vy = sum(r["p"][1] - r["q"][1] for r in rows_subset)
     L = math.hypot(vx, vy)
-    if L > 1e-6:                                  # реальное смещение
+    if L > 1e-6:
         return vx / L, vy / L
     s = dxf.segments[rows_subset[0]["si"]]
     ex, ey = s.bx - s.ax, s.by - s.ay
@@ -597,14 +586,13 @@ def leader_dir(rows_subset, dxf):
     nx, ny = -ey / el, ex / el
     cx, cy = _centroid(dxf)
     px, py = rows_subset[0]["p"]
-    # на образце выноски уходят ВНУТРЬ помещения → к центроиду
     if (px - cx) * nx + (py - cy) * ny > 0:
         nx, ny = -nx, -ny
     return nx, ny
 
 
 def make_flags(rows, txt, dxf, off):
-    use = [r for r in rows if r.get("in_flag")]        # только представители
+    use = [r for r in rows if r.get("in_flag")]
     groups: Dict[object, List[dict]] = {}
     for i, r in enumerate(use):
         groups.setdefault(r.get("pair_key") or ("one", i), []).append(r)
@@ -615,17 +603,19 @@ def make_flags(rows, txt, dxf, off):
         dn = next((r for r in g if r["mark"] == MARKS[0]), None)
         raw.append([r for r in (up, dn) if r] or sorted(g, key=pid_sort)[:1])
 
-    ch = off * 0.62
-    lw, iw, vw = ch * 0.85, ch * 1.55, ch * 1.75
-    w = lw + iw + vw
-    lead, diag, arr, pad = off * 2.4, off * 0.85, off * 0.30, ch * 0.22
+    ch = off * 0.62 * TEXT_SCALE         # ← ×2
+    lw = ch * 0.95                       # поле под букву
+    vw = ch * 3.20                       # поле под отклонение
+    w = lw + vw
+    lead, diag, arr = off * 3.2, off * 0.85, off * 0.30
+    pad = ch * 0.22
 
-    # жадный разнос: сначала своё место, потом кольца вокруг (без возврата к базе)
+    # невидимая область только для разноса подписей (на лист НЕ выводится)
     ring = [(0.0, 0.0)]
     for k in range(1, 11):
         for dx, dy in ((0, 1), (0, -1), (-1, 0), (1, 0),
                        (1, 1), (-1, 1), (1, -1), (-1, -1)):
-            ring.append((dx * k * w * 1.18, dy * k * ch * 1.75))
+            ring.append((dx * k * w * 1.18, dy * k * ch * 1.55))
 
     occupied, flags = [], []
     for ordered in raw:
@@ -651,8 +641,14 @@ def make_flags(rows, txt, dxf, off):
         occupied.append(chosen)
         x0, y0, _, _ = chosen
 
-        polka = ((x0 if nx >= 0 else x0 + w), y0 + h / 2.0)
-        shelf = (polka[0] + (w * 0.20 if nx >= 0 else -w * 0.20), polka[1])
+        # выноска подходит к краю текста, но не задевает букву
+        if nx >= 0:
+            polka = (x0 - w * 0.02, y0 + h / 2.0)
+            shelf = (x0 - w * 0.14, y0 + h / 2.0)
+        else:
+            polka = (x0 + w + w * 0.02, y0 + h / 2.0)
+            shelf = (x0 + w + w * 0.14, y0 + h / 2.0)
+
         back = (anchor[0] - nx * arr, anchor[1] - ny * arr)
         pp = (-ny * arr * 0.45, nx * arr * 0.45)
         arrow = [anchor,
@@ -662,8 +658,9 @@ def make_flags(rows, txt, dxf, off):
         flags.append({
             "rows": ordered, "anchor": anchor, "elbow": elbow,
             "shelf": shelf, "polka": polka, "arrow": arrow,
-            "box": chosen, "ch": ch, "cols": (lw, iw, vw),
-            "lines": [(r["mark"] or "·", r["pid"], f"{r['dp']:+.0f}", r["over"])
+            "box": chosen, "ch": ch, "cols": (lw, vw),
+            # ← НОМЕРА ТОЧКИ НЕТ: только буква и Δплан
+            "lines": [(r["mark"] or "·", f"{r['dp']:+.0f}", r["over"])
                       for r in ordered],
             "pair": len(ordered) > 1,
         })
@@ -673,27 +670,17 @@ def make_flags(rows, txt, dxf, off):
 # ─────────── Стрелочка смещения Q(полилиния) → P(факт) ───────────
 
 def offset_arrow_geom(r, dxf, off, ptk):
-    """
-    Q = проекция на полилинию, P = измеренная точка.
-    Геометрия в ЕДИНИЦАХ ДАННЫХ (метрах), не в pt:
-      line : Q → основание наконечника
-      tip  : залитый треугольник с вершиной в P
-      tick : короткая засечка на контуре, перпендикулярная РЕБРУ
-    None  → смещение ≈ 0: рисуем только крестик, как `+0` на образце.
-    """
     x, y = r["p"]
     qx, qy = r["q"]
     dx, dy = x - qx, y - qy
     d = math.hypot(dx, dy)
 
-    cr = off * 0.30 * ptk                 # размер крестика
+    cr = off * 0.30 * ptk
     min_vis = max(off * 0.10 * ptk, 1e-9)
     if d < min_vis:
         return None
 
-    ux, uy = dx / d, dy / d              # направление смещения
-
-    # наконечник ОГРАНИЧЕН сверху — иначе снова «бабочки» с рис. 1
+    ux, uy = dx / d, dy / d
     head = min(d * 0.42, off * 0.55 * ptk)
     head = max(head, d * 0.18)
     wing = head * 0.42
@@ -706,9 +693,6 @@ def offset_arrow_geom(r, dxf, off, ptk):
         (base[0] - px * wing, base[1] - py * wing),
     ]
 
-    # засечку ставим по нормали к СЕГМЕНТУ, а не к вектору смещения:
-    # у торца колонны (t=0/1) смещение может идти вдоль оси,
-    # а штрих на образце всё равно поперёк грани
     try:
         s = dxf.segments[r["si"]]
         ex, ey = s.bx - s.ax, s.by - s.ay
@@ -727,8 +711,8 @@ def offset_arrow_geom(r, dxf, off, ptk):
 
 # ═══════════ ОТРИСОВКА (образец / PNG / PDF) ═══════════
 
-def data_text(ax, x, y, s, cell_w, cell_h, color, fp, z=9, pad=0.10):
-    """Глиф в ЕДИНИЦАХ ДАННЫХ и вписанный в ячейку — вместо ax.text(pt)."""
+def data_text(ax, x, y, s, cell_w, cell_h, color, fp, z=9, pad=0.08):
+    """Глиф в ЕДИНИЦАХ ДАННЫХ, вписанный в поле (без рамки)."""
     s = str(s)
     try:
         tp = TextPath((0, 0), s, size=1.0, prop=fp)
@@ -742,8 +726,8 @@ def data_text(ax, x, y, s, cell_w, cell_h, color, fp, z=9, pad=0.10):
                          y + (cell_h - avail_h) / 2 - bb.y0 * k))
         ax.add_patch(PathPatch(tp.transformed(tr), facecolor=color,
                                edgecolor="none", linewidth=0, zorder=z))
-    except Exception:                       # безопасный fallback
-        ax.text(x + cell_w * pad, y + cell_h * 0.2, s, fontsize=4,
+    except Exception:
+        ax.text(x + cell_w * pad, y + cell_h * 0.2, s, fontsize=8,
                 color=color, fontproperties=fp, zorder=z)
 
 
@@ -756,24 +740,14 @@ def _new_fig():
 def render_scene(ax, dxf, rows, flags, txt):
     fp = cyr_fp()
     off, ptk = txt.off, txt.pt_k
-    INK, RED, EDGE, LEAD = "#1a1a1a", "#cc0000", "#333333", "#555555"
+    INK, RED, LEAD = "#1a1a1a", "#cc0000", "#555555"
 
-    # 1) зелёная штриховка тела (только замкнутые контуры)
-    if txt.hatch:
-        for pts, closed, _ in dxf.polylines:
-            if not closed or len(pts) < 3:
-                continue
-            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-            ax.fill(xs, ys, facecolor="#eaf5df", edgecolor="none", zorder=0)
-            ax.fill(xs, ys, facecolor="none", edgecolor="#9cc47a",
-                    hatch="///", linewidth=0.25, zorder=0.5)
-
-    # 2) тонкий серый контур проекта
+    # 1) ТОЛЬКО тонкий серый контур проекта — без штриховки
     for pts, _, _ in dxf.polylines:
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
                 color="#7d7d7d", lw=0.55, zorder=1)
 
-    # 3) СТРЕЛОЧКА СМЕЩЕНИЯ Q(полилиния) → P(факт) + красный крестик
+    # 2) СТРЕЛОЧКА СМЕЩЕНИЯ Q → P + красный крестик
     cr0 = off * 0.30 * ptk
     for r in rows:
         x, y = r["p"]
@@ -791,11 +765,10 @@ def render_scene(ax, dxf, rows, flags, txt):
                                 facecolor=RED, edgecolor="none", zorder=3))
 
         cr = ar["cr"] if ar else cr0
-        # крестик в фактической точке — ВСЕГДА, даже при Δ=0
         ax.plot([x - cr, x + cr], [y, y], color=RED, lw=0.55, zorder=3)
         ax.plot([x, x], [y - cr, y + cr], color=RED, lw=0.55, zorder=3)
 
-    # 4) выноски + плашки с БЕЛЫМ фоном
+    # 3) выноска + КРУПНАЯ подпись «В +25 / Н −20» БЕЗ рамки, БЕЗ номера
     for f in flags:
         a, e, sh, pk = f["anchor"], f["elbow"], f["shelf"], f["polka"]
         ax.plot([a[0], e[0]], [a[1], e[1]], color=LEAD, lw=0.30, zorder=4)
@@ -805,24 +778,14 @@ def render_scene(ax, dxf, rows, flags, txt):
                              edgecolor="none", zorder=5))
 
         x0, y0, w, h = f["box"]
-        ch = f["ch"]; lw, iw, vw = f["cols"]; cnt = len(f["lines"])
-        if txt.flagbox:
-            ax.add_patch(Rectangle((x0, y0), w, h, facecolor="white",
-                                   edgecolor=EDGE, lw=0.35, zorder=5))
-            for k in range(1, cnt):
-                ax.plot([x0, x0 + w], [y0 + k * ch, y0 + k * ch],
-                        color=EDGE, lw=0.30, zorder=6)
-            for xx in (x0 + lw, x0 + lw + iw):
-                ax.plot([xx, xx], [y0, y0 + h],
-                        color=EDGE, lw=0.30, zorder=6)
+        ch = f["ch"]; lw, vw = f["cols"]; cnt = len(f["lines"])
 
-        for k, (letter, pid, val, over) in enumerate(f["lines"]):
+        for k, (letter, val, over) in enumerate(f["lines"]):
             yy = y0 + (cnt - 1 - k) * ch
-            data_text(ax, x0,             yy, letter, lw, ch, INK, fp)
-            data_text(ax, x0 + lw,        yy, pid,    iw, ch, INK, fp)
-            data_text(ax, x0 + lw + iw,   yy, val,    vw, ch, RED, fp)
-            if over:                    # «вне допуска» — подчёркивание без нового цвета
-                ax.plot([x0 + lw + iw + vw * 0.10, x0 + w - vw * 0.10],
+            data_text(ax, x0,      yy, letter, lw, ch, INK, fp)   # буква ×2
+            data_text(ax, x0 + lw, yy, val,    vw, ch, RED, fp)   # цифры ×2
+            if over:
+                ax.plot([x0 + lw + vw * 0.10, x0 + w - vw * 0.10],
                         [yy + ch * 0.10, yy + ch * 0.10],
                         color=RED, lw=0.45, zorder=9)
 
@@ -862,7 +825,7 @@ def sample_scene(pt_k: float):
          "d_m": 0.015, "dp": -20.0, "h": 167.6719,
          "over": True, "si": 0, "mismatch": False},
     ]
-    txt = TxtData(pt_k=clamp_pt(pt_k), pair_r=0.50, pair_z=0.50, hatch=True)
+    txt = TxtData(pt_k=clamp_pt(pt_k), pair_r=0.50, pair_z=0.50)
     off, _ = geom_offset(dxf, rows)
     txt.off = off
     assign_marks(rows, txt, dxf)
@@ -881,16 +844,17 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
     doc = ezdxf.new("R2010")
     doc.header["$INSUNITS"] = 6
     doc.header["$MEASUREMENT"] = 1
-    doc.header["$PDMODE"] = 3                       # крестик, как на образце
+    doc.header["$PDMODE"] = 3
     doc.header["$PDSIZE"] = off * 0.30 * txt.pt_k
     style = ensure_cyr_style(doc)
 
-    for name, color in (("PROJ", 8), ("HATCH", 3), ("FACT", 1),
-                        ("DELTA", 1), ("OVER", 1), ("TAG", 7), ("LEAD", 8)):
+    for name, color in (("PROJ", 8), ("FACT", 1), ("DELTA", 1),
+                        ("OVER", 1), ("TAG", 7), ("LEAD", 8)):
         if name not in doc.layers:
             doc.layers.add(name, color=color)
     msp = doc.modelspace()
 
+    # проект — только контур, БЕЗ штриховки
     for pts, closed, _ in dxf.polylines:
         xy = [(p[0], p[1]) for p in pts]
         if closed and len(xy) > 2 and \
@@ -898,13 +862,6 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
             xy = xy[:-1]
         msp.add_lwpolyline(xy, close=closed,
                            dxfattribs={"layer": "PROJ", "elevation": pts[0][2]})
-        if txt.hatch and closed and len(xy) >= 3:
-            try:
-                h = msp.add_hatch(dxfattribs={"layer": "HATCH"})
-                h.set_pattern_fill("ANSI31", scale=max(off * 0.35, 0.01), color=3)
-                h.paths.add_polyline_path(xy, is_closed=True)
-            except Exception:
-                pass                                # старый ezdxf — просто контур
 
     cr = off * 0.30 * txt.pt_k
     for r in rows:
@@ -913,18 +870,16 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
         lay = "OVER" if r["over"] else "DELTA"
 
         msp.add_point((x, y), dxfattribs={"layer": "FACT"})
-        # явный крестик (POINT с PDMODE=3 не всегда виден в чужом вьюере)
         msp.add_line((x - cr, y), (x + cr, y), dxfattribs={"layer": "FACT"})
         msp.add_line((x, y - cr), (x, y + cr), dxfattribs={"layer": "FACT"})
 
-        # ── стрелочка смещения Q → P ──
         ar = offset_arrow_geom(r, dxf, off, txt.pt_k)
         if ar:
             msp.add_line(ar["line"][0], ar["line"][1],
                          dxfattribs={"layer": lay})
             tip3 = [(p[0], p[1], 0.0) for p in ar["tip"]]
             if len(tip3) == 3:
-                tip3.append(tip3[-1])       # DXF SOLID: 4 вершины, 3-я = 4-я
+                tip3.append(tip3[-1])       # DXF SOLID: 4 вершины
             try:
                 msp.add_solid(tip3, dxfattribs={"layer": lay})
             except Exception:
@@ -935,8 +890,8 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
             msp.add_circle((qx, qy), radius=ar["cr"] * 0.18,
                            dxfattribs={"layer": lay})
 
-    ch = off * 0.62
-    fs = ch * 0.55
+    ch = off * 0.62 * TEXT_SCALE           # ← ×2
+    fs = ch * 0.55                         # ← ×2 относительно старого
     for f in flags:
         a, e, sh, pk = f["anchor"], f["elbow"], f["shelf"], f["polka"]
         msp.add_line(a, e, dxfattribs={"layer": "LEAD"})
@@ -945,33 +900,21 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
         msp.add_lwpolyline(f["arrow"], close=True,
                            dxfattribs={"layer": "LEAD"})
 
-        x0, y0, w, h = f["box"]
-        lw, iw, vw = f["cols"]; cnt = len(f["lines"])
-        if txt.flagbox:
-            msp.add_lwpolyline([(x0, y0), (x0 + w, y0),
-                                (x0 + w, y0 + h), (x0, y0 + h)],
-                               close=True, dxfattribs={"layer": "TAG"})
-            for k in range(1, cnt):
-                msp.add_line((x0, y0 + k * ch), (x0 + w, y0 + k * ch),
-                             dxfattribs={"layer": "TAG"})
-            for xx in (x0 + lw, x0 + lw + iw):
-                msp.add_line((xx, y0), (xx, y0 + h),
-                             dxfattribs={"layer": "TAG"})
+        x0, y0, w, _ = f["box"]
+        lw, vw = f["cols"]; cnt = len(f["lines"])
 
-        for k, (letter, pid, val, over) in enumerate(f["lines"]):
+        # НИКАКОЙ рамки, НИКАКИХ перегородок, НИКАКОГО номера точки
+        for k, (letter, val, over) in enumerate(f["lines"]):
             yy = y0 + (cnt - 1 - k) * ch + ch * 0.20
             msp.add_text(letter, dxfattribs={
                 "layer": "TAG", "style": style, "height": fs,
                 "insert": (x0 + lw * 0.10, yy)})
-            msp.add_text(pid, dxfattribs={
-                "layer": "TAG", "style": style, "height": fs,
-                "insert": (x0 + lw + iw * 0.10, yy)})
             msp.add_text(val, dxfattribs={
                 "layer": "OVER" if over else "DELTA",
                 "style": style, "height": fs,
-                "insert": (x0 + lw + iw + vw * 0.10, yy)})
+                "insert": (x0 + lw + vw * 0.10, yy)})
             if over:
-                msp.add_line((x0 + lw + iw + vw * 0.10, yy - ch * 0.12),
+                msp.add_line((x0 + lw + vw * 0.10, yy - ch * 0.12),
                              (x0 + w - vw * 0.10, yy - ch * 0.12),
                              dxfattribs={"layer": "OVER"})
     doc.saveas(path)
@@ -986,11 +929,8 @@ def load_inputs(data: dict):
     txt.level_tol = data.get("level_tol", txt.level_tol)
     txt.pair_r = data.get("pair_r", txt.pair_r)
     txt.pair_z = data.get("pair_z", txt.pair_z)
-    txt.flagbox = data.get("flagbox", txt.flagbox)
-    txt.hatch = data.get("hatch", txt.hatch)
     txt.dxfunits = data.get("dxfunits", txt.dxfunits)
     txt.pt_k = clamp_pt(data.get("pt_k", txt.pt_k))
-    # МОДУЛЬ 0 решил → меняем ТОЛЬКО столбцы X/Y в TXT. H и SHIFT не трогаем.
     if data.get("swap_xy"):
         txt.points = [(pid, y, x, h) for pid, x, y, h in txt.points]
     dxf = parse_dxf(data["dxf_path"], txt.shift, txt.dxfunits, txt.level_tol)
@@ -1002,7 +942,7 @@ def build_scene(data: dict):
     rows = compute(txt, dxf)
     marks = assign_marks(rows, txt, dxf)
     off, th = geom_offset(dxf, rows)
-    txt.off = off                    # единый масштаб для render_scene
+    txt.off = off
     flags = make_flags(rows, txt, dxf, off)
     return txt, dxf, rows, off, th, flags, marks
 
@@ -1010,24 +950,21 @@ def build_scene(data: dict):
 def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
     npair = sum(1 for f in flags if f["pair"])
     head = [
-        f"Готово. Точек *{len(rows)}*, плашек *{len(flags)}* "
+        f"Готово. Точек *{len(rows)}*, подписей *{len(flags)}* "
         f"(пар В/Н — *{npair}*), полилиний *{len(dxf.polylines)}*, {dxf.scale_note}.",
         f"СК: *{'🔄 X↔Y применена' if swapped else 'без перестановки'}*.",
         f"*В/Н определены приложением*: пар по ΔH≥{txt.pair_z:.2f} м — "
         f"*{marks['pairs']}*, одиночных — *{marks['alone']}*. Порог H "
         f"*{marks['thr']:+.3f}* ({marks['src']}). Вводить В/Н в TXT не надо.",
-        f"Размер крестиков *{pt_label(txt.pt_k)}*; штриховка "
-        f"*{'вкл' if txt.hatch else 'выкл'}*.",
-        "Оформление по образцу ИС: зелёная штриховка тела, тонкий серый контур, "
-        "красная стрелка `Q→P` с залитым наконечником и засечкой у кромки, "
-        "крестик в точке, чёрная плашка `В │ № │ Δплан` / `Н │ № │ Δплан` "
-        "с выноской в свободное место. **Одна плашка на грань. "
-        "Только плановые смещения, мм.**",
+        f"Размер крестиков *{pt_label(txt.pt_k)}*; **буквы и цифры ×{TEXT_SCALE:.0f}**.",
+        "Оформление: тонкий серый контур **без штриховки**, красная стрелка "
+        "`Q→P` с залитым наконечником и засечкой у кромки, крестик в точке "
+        "и крупная подпись `В  +25` / `Н  −20` **без рамки, без номера точки**. "
+        "**Одна подпись на грань. Только плановые смещения, мм.**",
         "`+` = слева по обходу полилинии, `−` = справа. Вне допуска — "
-        "подчёркивание цифры и ❗ здесь, без лишнего цвета. "
-        "Легенды, штампа и рамки листа нет.",
+        "подчёркивание цифры и ❗ здесь. Легенды, штампа и рамки листа нет.",
         f"Кириллица: DXF-стиль `CYR` ({DXF_CYR_FONT}); в PDF глифы "
-        "вписаны в ячейку как вектор, не «плавают».",
+        "вписаны как вектор, не «плавают».",
     ]
     if warn:
         head.insert(1, warn)
@@ -1042,11 +979,11 @@ def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
         head.append("ℹ️ Часть точек не попала в допуск яруса — взято ближайшее Z.")
     head.append("")
     for f in flags[:10]:
-        lines = " / ".join(f"{a} {c} мм" for a, _, c, _ in f["lines"])
+        lines = " / ".join(f"{a} {c} мм" for a, c, _ in f["lines"])
         bad = " ❗" if any(r["over"] for r in f["rows"]) else ""
-        head.append(f"`{'/'.join(r['pid'] for r in f['rows'])}`  {lines}{bad}")
+        head.append(f"{lines}{bad}")
     if len(flags) > 10:
-        head.append(f"… и ещё {len(flags) - 10} плашек — все на схеме.")
+        head.append(f"… и ещё {len(flags) - 10} подписей — все на схеме.")
     return "\n".join(head)
 
 
@@ -1054,8 +991,9 @@ def preview_caption(txt, dxf, rows, flags, marks, swapped=False, warn=""):
     npair = sum(1 for f in flags if f["pair"])
     return (
         f"🖼 *PNG-превью* (до сборки файлов)\n"
-        f"Точек *{len(rows)}*, плашек *{len(flags)}* (пар В/Н — *{npair}*). "
-        f"Одна плашка на грань, красные стрелки `Q→P` с наконечником.\n"
+        f"Точек *{len(rows)}*, подписей *{len(flags)}* (пар В/Н — *{npair}*). "
+        f"Одна подпись на грань: `В +25` / `Н −20`, без рамки и без номера, "
+        f"текст ×{TEXT_SCALE:.0f}. Красные стрелки `Q→P` с наконечником.\n"
         f"СК: *{'🔄 X↔Y' if swapped else 'без перестановки'}*. "
         f"В/Н автоматически, порог H *{marks['thr']:+.3f}*.\n"
         f"Крестики *{pt_label(txt.pt_k)}* — кнопки перерисуют превью, "
@@ -1066,15 +1004,15 @@ def preview_caption(txt, dxf, rows, flags, marks, swapped=False, warn=""):
 
 def sample_caption(ptk):
     return (
-        "📐 *Образец оформления*: зелёная штриховка тела, серый контур, "
+        "📐 *Образец оформления*: тонкий серый контур **без штриховки**, "
         "красная стрелка от кромки к точке с залитым наконечником и засечкой, "
-        "крестики у грани и **одна** чёрная плашка "
-        "`В │ 1 │ +25` / `Н │ 2 │ −20` с тонкой выноской.\n"
-        "**Буквы поставило приложение само** по разнице `H` — в TXT писать "
-        "ничего не надо. Текст вписан в ячейку как вектор, поэтому не вылезает.\n\n"
+        "крестики у грани и **одна крупная подпись** `В  +25` / `Н  −20` "
+        "с тонкой выноской.\n"
+        "**Нет рамки, нет номера точки, буквы и цифры в 2 раза крупнее.** "
+        "Буквы поставило приложение само по разнице `H` — в TXT писать ничего не надо.\n\n"
         f"Размер крестиков *{pt_label(ptk)}* — подберите кнопками *до* ввода "
-        "файлов: уйдёт в DXF (`$PDSIZE`), PDF и PNG. Плашки не масштабируются. "
-        "Не рамка и не штамп — только флажок по образцу ИС."
+        "файлов: уйдёт в DXF (`$PDSIZE`), PDF и PNG. Подписи от этого не меняются. "
+        "Не рамка и не штамп — только выноска по образцу ИС."
     )
 
 
@@ -1144,10 +1082,10 @@ async def start(msg: types.Message, state: FSMContext):
         "`2,9500.9936,2867.6472,170.4933,,,,,,,,,,,`\n\n"
         "✅ **В/Н писать НЕ надо** — близкие по `XY` точки с `ΔH ≥ PAIRZ` "
         "→ пара, меньшая `H` = `Н`, большая = `В` (порядок строк не важен). "
-        "На каждую грань — **одна плашка**.\n"
-        "🎯 На схеме красная стрелка от кромки полилинии к точке "
-        "(залитый наконечник + засечка у грани), крестик в точке, "
-        "выноска к плашке `В/Н`.\n"
+        "На каждую грань — **одна подпись**.\n"
+        "🎯 На схеме: красная стрелка от кромки к точке, крестик и крупная "
+        "подпись `В  +25` / `Н  −20` **без рамки, без номера точки, без штриховки** "
+        f"(буквы и цифры ×{TEXT_SCALE:.0f}).\n"
         "✅ Хвост `,,,,`, десятичная точка, `;`, пробел, таб, запятая с "
         "пробелами и десятичная запятая — принимаются.\n"
         "⚠️ Не разбивайте число пробелом и не пишите `9505,1690,2865,1403` "
@@ -1162,9 +1100,7 @@ async def start(msg: types.Message, state: FSMContext):
         "`# TOL=10` — допуск плана, мм\n"
         "`# PAIRR=0.30`, `# PAIRZ=0.50` — пара по XY и по ΔH\n"
         "`# LEVELTOL=0.05` — привязка контура по Z\n"
-        "`# PTS=1.25` — размер крестиков/стрелок (или кнопки выше)\n"
-        "`# HATCH=0` — убрать зелёную штриховку тела\n"
-        "`# FLAGBOX=0` — убрать прямоугольничек плашки\n\n"
+        "`# PTS=1.25` — размер крестиков/стрелок (или кнопки выше)\n\n"
         "Затем *DXF* → проверка СК → PNG-превью → *✅ Собрать* → **DXF + PDF**.",
         parse_mode=ParseMode.MARKDOWN)
 
@@ -1187,14 +1123,14 @@ async def on_txt(msg: types.Message, state: FSMContext):
     await state.update_data(
         txt_path=p, shift=txt.shift, tol=txt.tol_mm,
         level_tol=txt.level_tol, pair_r=txt.pair_r, pair_z=txt.pair_z,
-        flagbox=txt.flagbox, hatch=txt.hatch, dxfunits=txt.dxfunits,
-        pt_k=pt_k, shift_checked=False, swap_xy=False, cs_done=False)
+        dxfunits=txt.dxfunits, pt_k=pt_k,
+        shift_checked=False, swap_xy=False, cs_done=False)
     await state.set_state(Form.wait_dxf)
     await msg.answer(
         f"TXT принят: точек *{len(txt.points)}*, H *{min(hs):.3f}…{max(hs):.3f}*, "
         f"допуск *{txt.tol_mm:.0f} мм*, PAIRZ *{txt.pair_z:.2f} м*, "
-        f"крестики *{pt_label(pt_k)}*, штриховка "
-        f"*{'вкл' if txt.hatch else 'выкл'}*.\nПришлите *DXF*.",
+        f"крестики *{pt_label(pt_k)}*, подписи ×{TEXT_SCALE:.0f} без рамки.\n"
+        "Пришлите *DXF*.",
         parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1428,7 +1364,7 @@ async def pv_plus(c: types.CallbackQuery, state: FSMContext):
 async def pv_info(c: types.CallbackQuery, state: FSMContext):
     d = await state.get_data()
     await c.answer(f"Крестики {pt_label(d.get('pt_k', 1.0))}: $PDSIZE в DXF, "
-                   "линии в PDF/PNG.")
+                   "линии в PDF/PNG. Подписи от этого не меняются.")
 
 
 @dp.callback_query(F.data == "pv_restart")
@@ -1458,12 +1394,12 @@ async def pv_build(c: types.CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN)
     await c.message.answer_document(
         FSInputFile(out_dxf),
-        caption=f"DXF: PROJ / HATCH / FACT / DELTA / TAG / LEAD, "
-                f"метры, $INSUNITS=6, стрелки Q→P, крестики {pt_label(txt.pt_k)}")
+        caption=f"DXF: PROJ / FACT / DELTA / TAG / LEAD, метры, $INSUNITS=6, "
+                f"стрелки Q→P, подписи ×{TEXT_SCALE:.0f} без рамки")
     await c.message.answer_document(
         FSInputFile(out_pdf),
-        caption=f"PDF — по образцу ИС со стрелками смещения, "
-                f"крестики {pt_label(txt.pt_k)}, зум в Telegram",
+        caption=f"PDF — `В +25` / `Н −20` ×{TEXT_SCALE:.0f} без рамки и номера, "
+                f"зум в Telegram",
         reply_markup=final_kb())
 
 
