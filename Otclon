@@ -1013,6 +1013,86 @@ def _near_segments(q, dxf, radius):
     return out
 
 
+# Полоса «рядом» для параллельных линий (метры)
+NEAR_PARALLEL_MIN = 0.10   # 10 см
+NEAR_PARALLEL_MAX = 1.00   # 1 м
+PARALLEL_DOT_MIN = 0.92    # |cos| направлений ≥ 0.92 ≈ ±23°
+
+
+def _seg_dir(s):
+    ex, ey = s.bx - s.ax, s.by - s.ay
+    el = math.hypot(ex, ey)
+    if el < 1e-12:
+        return None
+    return (ex / el, ey / el)
+
+
+def _parallel_side_push(q, src_seg, dxf, src_idx):
+    """
+    Ищет параллельные сегменты в полосе 0.10…1.00 м от точки q.
+    Возвращает единичный вектор «от параллельных стен» (куда лучше
+    сдвинуть подпись). Если параллельных нет — None (одиночная линия,
+    сторона любая).
+    """
+    if src_seg is None:
+        return None
+
+    td = _seg_dir(src_seg)
+    if td is None:
+        return None
+    tx, ty = td
+    # нормаль к исходной линии (две стороны)
+    n_left = (-ty, tx)
+    n_right = (ty, -tx)
+
+    # собираем параллельные в полосе
+    left_w = 0.0
+    right_w = 0.0
+    found = 0
+
+    # радиус поиска чуть больше MAX, чтобы не пропустить
+    near = _near_segments(q, dxf, NEAR_PARALLEL_MAX + 0.15)
+
+    for idx, s in near:
+        if idx == src_idx:
+            continue
+        d_here = _seg_xy_dist(q[0], q[1], s)
+        if d_here < NEAR_PARALLEL_MIN or d_here > NEAR_PARALLEL_MAX:
+            continue
+
+        sd = _seg_dir(s)
+        if sd is None:
+            continue
+        # параллельность: |dot| близко к 1
+        if abs(sd[0] * tx + sd[1] * ty) < PARALLEL_DOT_MIN:
+            continue
+
+        # на какой стороне лежит сегмент относительно src
+        # берём середину чужого сегмента
+        mx = 0.5 * (s.ax + s.bx)
+        my = 0.5 * (s.ay + s.by)
+        side = (mx - q[0]) * n_left[0] + (my - q[1]) * n_left[1]
+
+        # вес обратно пропорционален расстоянию (ближе = сильнее толкает)
+        w = 1.0 / max(d_here, NEAR_PARALLEL_MIN)
+        if side >= 0:
+            left_w += w
+        else:
+            right_w += w
+        found += 1
+
+    if found == 0:
+        return None  # одиночная линия
+
+    # толкаем в сторону с меньшим «весом» параллельных (свободнее)
+    if left_w < right_w:
+        return n_left
+    if right_w < left_w:
+        return n_right
+    # одинаково зажато — не навязываем
+    return None
+
+
 def _point_clearance(x, y, q, near_segments, off, src_idx):
     best = off * 20.0
     qx, qy = q
@@ -1106,13 +1186,16 @@ def make_flags(rows, txt, dxf, off):
 
     # --- лёгкое прореживание очень близких одиночных точек ---
     # Если две одиночные подписи ближе 0.55*off и |Δ| почти одинаковый —
-    # оставляем ту, у которой |Δ| больше (или первую).
+    # оставляем первую. Пары В/Н не трогаем.
+    # used_q всегда хранит пары (q, dp), иначе 'float' is not subscriptable.
     thinned: List[List[dict]] = []
-    used_q = []
+    used_q: List[Tuple[Tuple[float, float], float]] = []
     for ordered in raw:
         if len(ordered) > 1:          # пары В/Н не трогаем
             thinned.append(ordered)
-            used_q.append(ordered[0]["q"])
+            q0 = ordered[0]["q"]
+            dp0 = abs(ordered[0].get("dp", 0.0))
+            used_q.append((q0, dp0))
             continue
         q = ordered[0]["q"]
         dp = abs(ordered[0].get("dp", 0.0))
@@ -1147,6 +1230,13 @@ def make_flags(rows, txt, dxf, off):
             el = math.hypot(ex, ey) or 1.0
             n0 = (-ey / el, ex / el)
 
+        # Параллельные линии в полосе 0.10…1.00 м → толкаем подпись от них
+        push = _parallel_side_push(q, seg0, dxf, src_idx)
+        if push is not None:
+            _add_unique_dir(dirs, push)
+            # противоположную тоже оставляем как запасной вариант
+            _add_unique_dir(dirs, (-push[0], -push[1]))
+
         candidates = []
 
         for d in dirs:
@@ -1168,6 +1258,12 @@ def make_flags(rows, txt, dxf, off):
 
             real_bonus = 0.14 * off * (d[0] * u_real[0] + d[1] * u_real[1])
             normal_bonus = 0.08 * off * abs(d[0] * n0[0] + d[1] * n0[1])
+
+            # Бонус за сторону «от параллельных стен»
+            # (если параллельных нет — push=None, бонус 0)
+            push_bonus = 0.0
+            if push is not None:
+                push_bonus = 0.22 * off * (d[0] * push[0] + d[1] * push[1])
 
             dx, dy = d
             px, py = -dy, dx
@@ -1206,6 +1302,7 @@ def make_flags(rows, txt, dxf, off):
                         + 0.70 * box_clear
                         + real_bonus
                         + normal_bonus
+                        + push_bonus
                         - (abs(perp) * 0.04 + along * 0.06) * off
                         - (18.0 * off if overlap else 0.0)
                     )
