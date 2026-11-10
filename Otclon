@@ -936,14 +936,14 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 def standard_arrow(q, u, off, ptk):
     """
     Стрелка строго по нормали: от полилинии в сторону смещения.
-    Длиннее, чем раньше — лучше читается направление.
+    Длина ×2 относительно предыдущей версии (было 1.40 → 2.80).
     """
-    L = off * 1.40 * ptk          # длиннее (было 0.70)
+    L = off * 2.80 * ptk
     ux, uy = u
-    start = (q[0] + ux * L * 0.04, q[1] + uy * L * 0.04)
+    start = (q[0] + ux * L * 0.03, q[1] + uy * L * 0.03)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.32
-    wing = head * 0.40
+    head = L * 0.28
+    wing = head * 0.38
     px, py = -uy, ux
     a1 = (
         end[0] - ux * head + px * wing,
