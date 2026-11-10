@@ -1665,13 +1665,20 @@ def render_scene(ax, dxf, rows, flags, txt):
         w = f["cols"][0] + f["cols"][1]
         cnt = len(f["lines"])
         ang = f["angle"]
+        # локальная «вверх» для стека В над Н (⟂ базовой линии текста)
+        rad = math.radians(ang)
+        up_x = -math.sin(rad)
+        up_y = math.cos(rad)
 
         for k, (letter, val, hot) in enumerate(f["lines"]):
-            yy = y0 + (cnt - 1 - k) * row_h
+            # k=0 → В (верх), k=1 → Н (низ)
+            stack = (cnt - 1 - k) * row_h
+            lx = x0 + up_x * stack
+            ly = y0 + up_y * stack
             draw_flag_line(
                 ax,
-                x0,
-                yy,
+                lx,
+                ly,
                 w,
                 row_h,
                 letter,
