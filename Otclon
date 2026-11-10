@@ -935,15 +935,15 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 
 def standard_arrow(q, u, off, ptk):
     """
-    Короткая стрелка строго по нормали: от полилинии наружу.
-    Подпись ставится сразу за наконечником — близко к линии.
+    Стрелка строго по нормали: от полилинии в сторону смещения.
+    Длиннее, чем раньше — лучше читается направление.
     """
-    L = off * 0.70 * ptk          # короче, чем было
+    L = off * 1.40 * ptk          # длиннее (было 0.70)
     ux, uy = u
-    start = (q[0] + ux * L * 0.05, q[1] + uy * L * 0.05)
+    start = (q[0] + ux * L * 0.04, q[1] + uy * L * 0.04)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.38
-    wing = head * 0.42
+    head = L * 0.32
+    wing = head * 0.40
     px, py = -uy, ux
     a1 = (
         end[0] - ux * head + px * wing,
@@ -1167,14 +1167,14 @@ def make_flags(rows, txt, dxf, off):
             or sorted(g, key=pid_sort)[:1]
         )
 
-    # Размеры подписи. Подпись ставится БЛИЗКО к линии (маленький gap).
-    # Высота буквы В/Н и цифры одинаковая (один ch, один scale в draw_flag_line).
-    ch = off * 0.58 * TEXT_SCALE
-    lw = ch * 0.95          # ширина под букву
-    vw = ch * 2.80          # ширина под цифру (±xx)
+    # Размеры подписи. Буква и цифра одной высоты (scale по высоте).
+    # Допускается лёгкое наложение буквы и цифры.
+    ch = off * 0.62 * TEXT_SCALE
+    lw = ch * 0.90          # ширина под букву
+    vw = ch * 2.60          # ширина под цифру (±xx)
     w = lw + vw
     pad = ch * 0.18
-    gap = ch * 0.08         # почти сразу за наконечником стрелки
+    gap = ch * 0.18         # небольшой отступ после наконечника (стрелка длиннее)
 
     # Небольшие смещения вдоль нормали / вдоль линии — чтобы развести соседей,
     # но не уносить далеко от полилинии.
@@ -1386,23 +1386,23 @@ def _text_path_cached(s: str):
 @lru_cache(maxsize=2048)
 def _flag_pair_cached(letter: str, val: str):
     """
-    Буква + цифра на одной базовой линии.
-    Оба глифа нормализованы к высоте 1.0 → в draw_flag_line получают
-    одинаковый масштаб (одна высота текста).
+    Буква + цифра на одной базовой линии, ОДИНАКОВОЙ высоты.
+    Оба глифа нормализованы к высоте 1.0 → один масштаб.
+    Небольшой gap (можно слегка накладываться) — читается как пара.
     """
     tl, x0l, wl, hl = _text_path_cached(letter)
     tv, x0v, wv, hv = _text_path_cached(val)
 
-    # нормализуем каждый глиф к высоте 1
+    # нормализуем каждый глиф к высоте 1 — буква и цифра одной высоты
     kl = 1.0 / max(hl, 1e-6)
     kv = 1.0 / max(hv, 1e-6)
 
-    gap = 0.28  # зазор между буквой и цифрой в «единицах высоты»
+    # маленький зазор: допускается лёгкое наложение
+    gap = 0.06
 
     p_l = tl.transformed(
         Affine2D().translate(-x0l, 0.0).scale(kl, kl)
     )
-    # после scale ширина буквы = wl*kl
     p_v = tv.transformed(
         Affine2D()
         .translate(-x0v, 0.0)
@@ -1441,12 +1441,16 @@ def draw_flag_line(
         str(val),
     )
 
-    # Целевая высота текста = cell_h * TEXT_FILL (одинакова для В/Н и цифр)
+    # Буква и цифра — одинаковой высоты (scale только по высоте).
+    # Ширину почти не ограничиваем: допускается выход за ячейку и
+    # лёгкое наложение буквы/цифры.
     target_h = cell_h * TEXT_FILL
-    # ширина не должна вылезать из ячейки
-    target_w = w * 0.94
+    k = target_h / max(th, 1e-6)
 
-    k = min(target_h / max(th, 1e-6), target_w / max(tw, 1e-6))
+    # если пара слишком широкая — слегка поджимаем, но не сильнее 15%
+    max_w = w * 1.25
+    if tw * k > max_w:
+        k = max(k * 0.85, max_w / max(tw, 1e-6))
 
     cx = x0 + w / 2.0
     cy = y0 + cell_h / 2.0
@@ -1725,7 +1729,7 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
         )
 
     ch = off * 0.70 * TEXT_SCALE
-    fs = ch * 0.72
+    fs = ch * 0.78   # буква и цифра одной высоты
 
     for f in flags:
         ar = f["arrow"]
@@ -1752,15 +1756,16 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
         ang = f["angle"]
 
         for k, (letter, val, hot) in enumerate(f["lines"]):
-            yy = y0 + (cnt - 1 - k) * row_h + row_h * 0.22
+            yy = y0 + (cnt - 1 - k) * row_h + row_h * 0.18
 
+            # буква и цифра ближе друг к другу (допускается лёгкое наложение)
             msp.add_text(letter, dxfattribs={
                 "layer": "TAG",
                 "style": style,
                 "height": fs,
                 "rotation": ang,
                 "color": 7,
-                "insert": (x0 + lw * 0.10, yy),
+                "insert": (x0 + lw * 0.05, yy),
             })
 
             msp.add_text(val, dxfattribs={
@@ -1769,7 +1774,7 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
                 "height": fs,
                 "rotation": ang,
                 "color": 1 if hot else 7,
-                "insert": (x0 + lw + vw * 0.10, yy),
+                "insert": (x0 + lw * 0.85, yy),  # ближе к букве, лёгкое наложение OK
             })
 
     doc.saveas(path)
