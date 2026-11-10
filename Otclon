@@ -249,19 +249,28 @@ def check_cs(txt_points, dxf_segments, shift=(0.0, 0.0)) -> CSReport:
     )
 
 
-def cs_text(rep: CSReport, shift=(0.0, 0.0), swapped: bool = False) -> str:
+def cs_text(
+    rep: CSReport,
+    shift=(0.0, 0.0),
+    swapped: bool = False,
+    auto_swapped: bool = False,
+) -> str:
     gain = rep.direct / max(rep.swapped, 1e-6)
     orient = "X↔Y" if swapped else "исходная"
     lines = [
         f"🔎 *СК*: {orient}. медиана *{rep.direct:,.1f} м* "
         f"(X↔Y → *{rep.swapped:,.1f} м*).",
     ]
+    if auto_swapped:
+        lines.append(
+            f"🔄 Авто: в TXT применён *X↔Y* (лучше в *{gain:.0f}×*)."
+        )
     if rep.ok:
         lines.append(f"✅ Рядом (≤{NEAR_M:.0f} м) → превью.")
-    elif rep.suggest_swap:
+    elif rep.suggest_swap and not swapped:
         lines.append(
             f"⚠️ Оси переставлены (лучше в *{gain:.0f}×*). "
-            "🔄 Поменять X↔Y / 🔁 Перепроверить / Оставить."
+            "Авто-смена не сработала — 🔄 вручную / 🔁 / Оставить."
         )
     else:
         lines.append(
@@ -1913,22 +1922,22 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
     fs = ch * 0.78   # буква и цифра одной высоты
 
     for f in flags:
-        ar = f["arrow"]
-        msp.add_line(
-            ar["start"],
-            ar["end"],
-            dxfattribs={"layer": "ARROW"},
-        )
-        msp.add_line(
-            ar["end"],
-            ar["a1"],
-            dxfattribs={"layer": "ARROW"},
-        )
-        msp.add_line(
-            ar["end"],
-            ar["a2"],
-            dxfattribs={"layer": "ARROW"},
-        )
+        for ar in (f.get("arrows") or [f["arrow"]]):
+            msp.add_line(
+                ar["start"],
+                ar["end"],
+                dxfattribs={"layer": "ARROW"},
+            )
+            msp.add_line(
+                ar["end"],
+                ar["a1"],
+                dxfattribs={"layer": "ARROW"},
+            )
+            msp.add_line(
+                ar["end"],
+                ar["a2"],
+                dxfattribs={"layer": "ARROW"},
+            )
 
         x0, y0, _, _ = f["box"]
         lw, vw = f["cols"]
@@ -2543,6 +2552,7 @@ async def run_cs_check(
         await state.set_state(Form.wait_txt)
         return
 
+    auto_swapped = False
     try:
         txt, dxf = load_inputs(data)
     except Exception as e:
@@ -2556,8 +2566,25 @@ async def run_cs_check(
     rep = check_cs(txt.points, dxf.segments, txt.shift)
     swapped = bool(data.get("swap_xy"))
 
+    # 1-я стадия: если оси переставлены — сразу меняем СК в TXT
+    if (not swapped) and rep.suggest_swap and (not rep.ok):
+        await state.update_data(swap_xy=True)
+        data = await state.get_data()
+        try:
+            txt, dxf = load_inputs(data)
+        except Exception as e:
+            await msg.answer(
+                f"Ошибка после авто X↔Y: `{md_code(e)}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            await state.set_state(Form.wait_dxf)
+            return
+        rep = check_cs(txt.points, dxf.segments, txt.shift)
+        swapped = True
+        auto_swapped = True
+
     await msg.answer(
-        cs_text(rep, txt.shift, swapped),
+        cs_text(rep, txt.shift, swapped, auto_swapped=auto_swapped),
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=None if rep.ok else cs_kb(swapped),
     )
