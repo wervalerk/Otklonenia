@@ -887,45 +887,43 @@ def _source_index(row, dxf) -> int:
     return -1
 
 
-def offset_dir(rows_subset, dxf):
-    r0 = rows_subset[0]
-    dx0 = r0["p"][0] - r0["q"][0]
-    dy0 = r0["p"][1] - r0["q"][1]
-    L0 = math.hypot(dx0, dy0)
-    if L0 > 1e-9:
-        return dx0 / L0, dy0 / L0
-
-    vx = sum(r["p"][0] - r["q"][0] for r in rows_subset)
-    vy = sum(r["p"][1] - r["q"][1] for r in rows_subset)
-    L = math.hypot(vx, vy)
-    if L > 1e-9:
-        return vx / L, vy / L
-
-    s = _safe_segment(dxf, rows_subset[0])
-    if s is None:
-        return 1.0, 0.0
-    ex, ey = s.bx - s.ax, s.by - s.ay
+def _perp_normal(seg, prefer=None):
+    """Единичная нормаль к сегменту. Если prefer задан — выбираем сторону
+    с положительным скалярным произведением на prefer."""
+    if seg is None:
+        return (1.0, 0.0)
+    ex, ey = seg.bx - seg.ax, seg.by - seg.ay
     el = math.hypot(ex, ey) or 1.0
     nx, ny = -ey / el, ex / el
-    if rows_subset[0].get("dp", 0.0) < 0:
+    if prefer is not None and (nx * prefer[0] + ny * prefer[1]) < 0:
         nx, ny = -nx, -ny
-    return nx, ny
+    return (nx, ny)
+
+
+def offset_dir(rows_subset, dxf):
+    """
+    Направление стрелки / сдвига подписи:
+    ВСЕГДА перпендикулярно полилинии (90°), в сторону фактической точки
+    (или в сторону dp, если точка почти на линии).
+    """
+    r0 = rows_subset[0]
+    s = _safe_segment(dxf, r0)
+
+    # предпочтение: куда лежит точка относительно q
+    prefer = (r0["p"][0] - r0["q"][0], r0["p"][1] - r0["q"][1])
+    if math.hypot(*prefer) < 1e-9:
+        # точка почти на линии — по знаку dp
+        prefer = (1.0, 0.0) if r0.get("dp", 0.0) >= 0 else (-1.0, 0.0)
+
+    return _perp_normal(s, prefer)
 
 
 def text_angle(rows_subset, dxf, u=None) -> float:
-    s = _safe_segment(dxf, rows_subset[0])
-    if s is None:
-        return 0.0
-    ex, ey = s.bx - s.ax, s.by - s.ay
-    el = math.hypot(ex, ey) or 1.0
-    nx, ny = -ey / el, ex / el
-
+    """Угол текста = угол нормали (подпись вдоль нормали, ⟂ линии)."""
     if u is None:
         u = offset_dir(rows_subset, dxf)
-    if nx * u[0] + ny * u[1] < 0:
-        nx, ny = -nx, -ny
-
-    theta = math.degrees(math.atan2(ny, nx))
+    theta = math.degrees(math.atan2(u[1], u[0]))
+    # держим текст читаемым (не вверх ногами)
     if theta > 90.0:
         theta -= 180.0
     if theta < -90.0:
@@ -936,13 +934,16 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 
 
 def standard_arrow(q, u, off, ptk):
-    # Чуть длиннее стрелка → подпись дальше от линии, меньше наложений
-    L = off * 1.45 * ptk
+    """
+    Короткая стрелка строго по нормали: от полилинии наружу.
+    Подпись ставится сразу за наконечником — близко к линии.
+    """
+    L = off * 0.70 * ptk          # короче, чем было
     ux, uy = u
-    start = (q[0] + ux * L * 0.08, q[1] + uy * L * 0.08)
+    start = (q[0] + ux * L * 0.05, q[1] + uy * L * 0.05)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.32
-    wing = head * 0.40
+    head = L * 0.38
+    wing = head * 0.42
     px, py = -uy, ux
     a1 = (
         end[0] - ux * head + px * wing,
@@ -973,28 +974,22 @@ def _add_unique_dir(dirs, d):
 
 
 def _candidate_dirs(ordered, dxf):
+    """Только две нормали (±90° к полилинии). Вдоль линии не предлагаем —
+    стрелка должна быть строго перпендикулярна."""
     dirs = []
     u = offset_dir(ordered, dxf)
     _add_unique_dir(dirs, u)
     _add_unique_dir(dirs, (-u[0], -u[1]))
 
-    for r in ordered:
-        s = _safe_segment(dxf, r)
-        if s is None:
-            continue
-        ex, ey = s.bx - s.ax, s.by - s.ay
-        el = math.hypot(ex, ey) or 1.0
-        tx, ty = ex / el, ey / el
-        nx, ny = -ty, tx
-
-        _add_unique_dir(dirs, (nx, ny))
-        _add_unique_dir(dirs, (-nx, -ny))
-        _add_unique_dir(dirs, (tx, ty))
-        _add_unique_dir(dirs, (-tx, -ty))
+    s = _safe_segment(dxf, ordered[0])
+    if s is not None:
+        n = _perp_normal(s, None)
+        _add_unique_dir(dirs, n)
+        _add_unique_dir(dirs, (-n[0], -n[1]))
 
     if not dirs:
         dirs = [(1.0, 0.0), (-1.0, 0.0)]
-    return dirs[:8]
+    return dirs[:4]
 
 
 def _near_segments(q, dxf, radius):
@@ -1011,6 +1006,86 @@ def _near_segments(q, dxf, radius):
             continue
         out.append((idx, s))
     return out
+
+
+# Полоса «рядом» для параллельных линий (метры)
+NEAR_PARALLEL_MIN = 0.10   # 10 см
+NEAR_PARALLEL_MAX = 1.00   # 1 м
+PARALLEL_DOT_MIN = 0.92    # |cos| направлений ≥ 0.92 ≈ ±23°
+
+
+def _seg_dir(s):
+    ex, ey = s.bx - s.ax, s.by - s.ay
+    el = math.hypot(ex, ey)
+    if el < 1e-12:
+        return None
+    return (ex / el, ey / el)
+
+
+def _parallel_side_push(q, src_seg, dxf, src_idx):
+    """
+    Ищет параллельные сегменты в полосе 0.10…1.00 м от точки q.
+    Возвращает единичный вектор «от параллельных стен» (куда лучше
+    сдвинуть подпись). Если параллельных нет — None (одиночная линия,
+    сторона любая).
+    """
+    if src_seg is None:
+        return None
+
+    td = _seg_dir(src_seg)
+    if td is None:
+        return None
+    tx, ty = td
+    # нормаль к исходной линии (две стороны)
+    n_left = (-ty, tx)
+    n_right = (ty, -tx)
+
+    # собираем параллельные в полосе
+    left_w = 0.0
+    right_w = 0.0
+    found = 0
+
+    # радиус поиска чуть больше MAX, чтобы не пропустить
+    near = _near_segments(q, dxf, NEAR_PARALLEL_MAX + 0.15)
+
+    for idx, s in near:
+        if idx == src_idx:
+            continue
+        d_here = _seg_xy_dist(q[0], q[1], s)
+        if d_here < NEAR_PARALLEL_MIN or d_here > NEAR_PARALLEL_MAX:
+            continue
+
+        sd = _seg_dir(s)
+        if sd is None:
+            continue
+        # параллельность: |dot| близко к 1
+        if abs(sd[0] * tx + sd[1] * ty) < PARALLEL_DOT_MIN:
+            continue
+
+        # на какой стороне лежит сегмент относительно src
+        # берём середину чужого сегмента
+        mx = 0.5 * (s.ax + s.bx)
+        my = 0.5 * (s.ay + s.by)
+        side = (mx - q[0]) * n_left[0] + (my - q[1]) * n_left[1]
+
+        # вес обратно пропорционален расстоянию (ближе = сильнее толкает)
+        w = 1.0 / max(d_here, NEAR_PARALLEL_MIN)
+        if side >= 0:
+            left_w += w
+        else:
+            right_w += w
+        found += 1
+
+    if found == 0:
+        return None  # одиночная линия
+
+    # толкаем в сторону с меньшим «весом» параллельных (свободнее)
+    if left_w < right_w:
+        return n_left
+    if right_w < left_w:
+        return n_right
+    # одинаково зажато — не навязываем
+    return None
 
 
 def _point_clearance(x, y, q, near_segments, off, src_idx):
@@ -1092,30 +1167,44 @@ def make_flags(rows, txt, dxf, off):
             or sorted(g, key=pid_sort)[:1]
         )
 
-    # Размеры подписи: чуть компактнее, больше зазор от стрелки
-    ch = off * 0.62 * TEXT_SCALE
-    lw = ch * 0.90
-    vw = ch * 2.90
+    # Размеры подписи. Подпись ставится БЛИЗКО к линии (маленький gap).
+    # Высота буквы В/Н и цифры одинаковая (один ch, один scale в draw_flag_line).
+    ch = off * 0.58 * TEXT_SCALE
+    lw = ch * 0.95          # ширина под букву
+    vw = ch * 2.80          # ширина под цифру (±xx)
     w = lw + vw
-    pad = ch * 0.22          # больший зазор между флагами
-    gap = ch * 0.32          # дальше от конца стрелки
+    pad = ch * 0.18
+    gap = ch * 0.08         # почти сразу за наконечником стрелки
 
-    # Больше вариантов смещения — легче уйти от наложений
-    micro_perp = [0.0, 0.45, -0.45, 0.90, -0.90, 1.40, -1.40, 1.90, -1.90]
-    micro_along = [0.0, 0.30, 0.60, 0.95]
+    # Небольшие смещения вдоль нормали / вдоль линии — чтобы развести соседей,
+    # но не уносить далеко от полилинии.
+    micro_perp = [0.0, 0.25, -0.25, 0.55, -0.55, 0.90, -0.90]
+    micro_along = [0.0, 0.20, 0.45, -0.20]
 
     # --- лёгкое прореживание очень близких одиночных точек ---
     # Если две одиночные подписи ближе 0.55*off и |Δ| почти одинаковый —
-    # оставляем ту, у которой |Δ| больше (или первую).
+    # оставляем первую. Пары В/Н не трогаем.
+    # ВАЖНО: used_q всегда хранит кортежи (q, dp), где q = (x, y).
+    # Раньше при парах клали только q → потом unpack делал prev_q = float
+    # и падало с "'float' object is not subscriptable".
     thinned: List[List[dict]] = []
-    used_q = []
+    used_q: List[Tuple[Tuple[float, float], float]] = []
     for ordered in raw:
         if len(ordered) > 1:          # пары В/Н не трогаем
             thinned.append(ordered)
-            used_q.append(ordered[0]["q"])
+            q0 = ordered[0]["q"]
+            # защита: q должен быть (x, y)
+            if not (isinstance(q0, (tuple, list)) and len(q0) >= 2):
+                continue
+            dp0 = abs(float(ordered[0].get("dp", 0.0) or 0.0))
+            used_q.append(((float(q0[0]), float(q0[1])), dp0))
             continue
         q = ordered[0]["q"]
-        dp = abs(ordered[0].get("dp", 0.0))
+        if not (isinstance(q, (tuple, list)) and len(q) >= 2):
+            thinned.append(ordered)
+            continue
+        q = (float(q[0]), float(q[1]))
+        dp = abs(float(ordered[0].get("dp", 0.0) or 0.0))
         too_close = False
         for prev_q, prev_dp in used_q:
             if math.hypot(q[0] - prev_q[0], q[1] - prev_q[1]) < off * 0.55:
@@ -1147,6 +1236,13 @@ def make_flags(rows, txt, dxf, off):
             el = math.hypot(ex, ey) or 1.0
             n0 = (-ey / el, ex / el)
 
+        # Параллельные линии в полосе 0.10…1.00 м → толкаем подпись от них
+        push = _parallel_side_push(q, seg0, dxf, src_idx)
+        if push is not None:
+            _add_unique_dir(dirs, push)
+            # противоположную тоже оставляем как запасной вариант
+            _add_unique_dir(dirs, (-push[0], -push[1]))
+
         candidates = []
 
         for d in dirs:
@@ -1168,6 +1264,12 @@ def make_flags(rows, txt, dxf, off):
 
             real_bonus = 0.14 * off * (d[0] * u_real[0] + d[1] * u_real[1])
             normal_bonus = 0.08 * off * abs(d[0] * n0[0] + d[1] * n0[1])
+
+            # Бонус за сторону «от параллельных стен»
+            # (если параллельных нет — push=None, бонус 0)
+            push_bonus = 0.0
+            if push is not None:
+                push_bonus = 0.22 * off * (d[0] * push[0] + d[1] * push[1])
 
             dx, dy = d
             px, py = -dy, dx
@@ -1206,6 +1308,7 @@ def make_flags(rows, txt, dxf, off):
                         + 0.70 * box_clear
                         + real_bonus
                         + normal_bonus
+                        + push_bonus
                         - (abs(perp) * 0.04 + along * 0.06) * off
                         - (18.0 * off if overlap else 0.0)
                     )
@@ -1282,24 +1385,39 @@ def _text_path_cached(s: str):
 
 @lru_cache(maxsize=2048)
 def _flag_pair_cached(letter: str, val: str):
-    """Буква + цифра на одной базовой линии, небольшой стабильный зазор."""
-    tl, x0l, wl, _hl = _text_path_cached(letter)
-    tv, x0v, _wv, _hv = _text_path_cached(val)
+    """
+    Буква + цифра на одной базовой линии.
+    Оба глифа нормализованы к высоте 1.0 → в draw_flag_line получают
+    одинаковый масштаб (одна высота текста).
+    """
+    tl, x0l, wl, hl = _text_path_cached(letter)
+    tv, x0v, wv, hv = _text_path_cached(val)
 
-    gap = 0.38   # чуть плотнее, чтобы пара читалась как одно целое
+    # нормализуем каждый глиф к высоте 1
+    kl = 1.0 / max(hl, 1e-6)
+    kv = 1.0 / max(hv, 1e-6)
 
-    p_l = tl.transformed(Affine2D().translate(-x0l, 0.0))
-    p_v = tv.transformed(Affine2D().translate(wl + gap - x0v, 0.0))
+    gap = 0.28  # зазор между буквой и цифрой в «единицах высоты»
+
+    p_l = tl.transformed(
+        Affine2D().translate(-x0l, 0.0).scale(kl, kl)
+    )
+    # после scale ширина буквы = wl*kl
+    p_v = tv.transformed(
+        Affine2D()
+        .translate(-x0v, 0.0)
+        .scale(kv, kv)
+        .translate(wl * kl + gap, 0.0)
+    )
 
     bl, bv = p_l.get_extents(), p_v.get_extents()
-
     xmin = min(bl.x0, bv.x0)
     xmax = max(bl.x1, bv.x1)
     ymin = min(bl.y0, bv.y0)
     ymax = max(bl.y1, bv.y1)
 
     total_w = max(xmax - xmin, 1e-6)
-    total_h = max(ymax - ymin, 1e-6)
+    total_h = max(ymax - ymin, 1e-6)  # ≈ 1.0
     local_cx = (xmin + xmax) / 2.0
     local_cy = (ymin + ymax) / 2.0
 
@@ -1323,12 +1441,12 @@ def draw_flag_line(
         str(val),
     )
 
-    if abs(angle) > 45.0:
-        L_av, H_av = cell_h * 0.92, w * 0.86
-    else:
-        L_av, H_av = w * 0.92, cell_h * TEXT_FILL
+    # Целевая высота текста = cell_h * TEXT_FILL (одинакова для В/Н и цифр)
+    target_h = cell_h * TEXT_FILL
+    # ширина не должна вылезать из ячейки
+    target_w = w * 0.94
 
-    k = min(H_av / th, L_av / tw)
+    k = min(target_h / max(th, 1e-6), target_w / max(tw, 1e-6))
 
     cx = x0 + w / 2.0
     cy = y0 + cell_h / 2.0
