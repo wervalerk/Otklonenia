@@ -1503,35 +1503,44 @@ def _text_path_cached(s: str):
 @lru_cache(maxsize=2048)
 def _flag_pair_cached(letter: str, val: str):
     """
-    Буква + цифра СТРОГО одной высоты, на одной базовой линии.
-    Оба глифа рисуются с одним font size, выравниваются по baseline,
-    затем общий масштаб подгоняет пару под target_h.
+    Буква + цифра СТРОГО одной высоты.
+    Каждый глиф нормализуется к высоте 1.0 своим коэффициентом,
+    затем выравнивается по нижней границе (одна база).
     """
     tl, x0l, wl, hl = _text_path_cached(letter)
     tv, x0v, wv, hv = _text_path_cached(val)
 
-    # Общая опорная высота = max(hl, hv) — оба глифа масштабируем
-    # одинаково, чтобы визуальная высота совпадала точно.
-    href = max(hl, hv, 1e-6)
-    k_common = 1.0 / href
+    # каждый глиф → высота ровно 1.0
+    kl = 1.0 / max(hl, 1e-6)
+    kv = 1.0 / max(hv, 1e-6)
 
-    # маленький зазор между буквой и цифрой
-    gap = 0.08 * href  # в единицах исходного size=1.0
+    # сдвиг к x=0, масштаб к h=1, низ на y=0
+    # TextPath bbox: y0..y1 → после scale высота 1, сдвигаем -y0*k
+    # сначала scale, потом узнаём y0 из extents
 
-    # оба: сдвиг к x=0, вниз на свой y0 (baseline), общий scale
     p_l = tl.transformed(
         Affine2D()
         .translate(-x0l, 0.0)
-        .scale(k_common, k_common)
+        .scale(kl, kl)
     )
-    # ширина буквы после scale
-    w_letter = wl * k_common
     p_v = tv.transformed(
         Affine2D()
         .translate(-x0v, 0.0)
-        .scale(k_common, k_common)
-        .translate(w_letter + gap * k_common, 0.0)
+        .scale(kv, kv)
     )
+
+    # выровнять низ обоих на y=0
+    bl0 = p_l.get_extents()
+    bv0 = p_v.get_extents()
+    p_l = p_l.transformed(Affine2D().translate(0.0, -bl0.y0))
+    p_v = p_v.transformed(Affine2D().translate(0.0, -bv0.y0))
+
+    # ширина буквы после нормализации
+    bl1 = p_l.get_extents()
+    w_letter = max(bl1.width, 1e-6)
+
+    gap = 0.10  # в единицах высоты (=1.0)
+    p_v = p_v.transformed(Affine2D().translate(w_letter + gap, 0.0))
 
     bl, bv = p_l.get_extents(), p_v.get_extents()
     xmin = min(bl.x0, bv.x0)
@@ -1540,7 +1549,7 @@ def _flag_pair_cached(letter: str, val: str):
     ymax = max(bl.y1, bv.y1)
 
     total_w = max(xmax - xmin, 1e-6)
-    total_h = max(ymax - ymin, 1e-6)
+    total_h = max(ymax - ymin, 1e-6)  # ≈ 1.0
     local_cx = (xmin + xmax) / 2.0
     local_cy = (ymin + ymax) / 2.0
 
@@ -1878,18 +1887,29 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
         row_h = f["row_h"]
         cnt = len(f["lines"])
         ang = f["angle"]
+        rad = math.radians(ang)
+        up_x = -math.sin(rad)
+        up_y = math.cos(rad)
+        # вдоль базовой линии текста (для буквы → цифры)
+        along_x = math.cos(rad)
+        along_y = math.sin(rad)
 
         for k, (letter, val, hot) in enumerate(f["lines"]):
-            yy = y0 + (cnt - 1 - k) * row_h + row_h * 0.18
+            # k=0 → В сверху, k=1 → Н снизу (смещение ⟂ тексту)
+            stack = (cnt - 1 - k) * row_h + row_h * 0.12
+            base_x = x0 + up_x * stack
+            base_y = y0 + up_y * stack
 
-            # буква и цифра ближе друг к другу (допускается лёгкое наложение)
             msp.add_text(letter, dxfattribs={
                 "layer": "TAG",
                 "style": style,
                 "height": fs,
                 "rotation": ang,
                 "color": 7,
-                "insert": (x0 + lw * 0.05, yy),
+                "insert": (
+                    base_x + along_x * lw * 0.05,
+                    base_y + along_y * lw * 0.05,
+                ),
             })
 
             msp.add_text(val, dxfattribs={
@@ -1898,7 +1918,10 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
                 "height": fs,
                 "rotation": ang,
                 "color": 1 if hot else 7,
-                "insert": (x0 + lw * 0.85, yy),  # ближе к букве, лёгкое наложение OK
+                "insert": (
+                    base_x + along_x * lw * 0.85,
+                    base_y + along_y * lw * 0.85,
+                ),
             })
 
     doc.saveas(path)
