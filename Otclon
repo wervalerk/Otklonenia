@@ -44,6 +44,138 @@ SHIFT_M = 50.0
 DXF_MAX_MB = 30
 DXF_MAX_BYTES = DXF_MAX_MB * 1024 * 1024  # 31 457 280 байт
 
+# ─── 4 ячейки подложек (DXF) на диске ───
+UNDERLAY_DIR = Path("/home/workdir/artifacts/underlays")
+UNDERLAY_DIR.mkdir(parents=True, exist_ok=True)
+UNDERLAY_META = UNDERLAY_DIR / "slots.json"
+UNDERLAY_SLOTS = (1, 2, 3, 4)
+
+
+def _slot_path(n: int) -> Path:
+    return UNDERLAY_DIR / f"slot{n}.dxf"
+
+
+def _load_slot_meta() -> dict:
+    if UNDERLAY_META.exists():
+        try:
+            import json
+            return json.loads(UNDERLAY_META.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_slot_meta(meta: dict) -> None:
+    import json
+    UNDERLAY_META.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def list_underlay_slots() -> Dict[int, dict]:
+    """{1: {name, size_mb, path, saved}, ...} только заполненные."""
+    meta = _load_slot_meta()
+    out = {}
+    for n in UNDERLAY_SLOTS:
+        p = _slot_path(n)
+        if p.exists() and p.stat().st_size > 0:
+            info = meta.get(str(n), {})
+            out[n] = {
+                "name": info.get("name") or p.stem,
+                "size_mb": p.stat().st_size / 1024 / 1024,
+                "path": str(p),
+                "saved": info.get("saved", ""),
+            }
+    return out
+
+
+def save_underlay_slot(n: int, src: str, name: str = "") -> str:
+    """Копирует DXF в ячейку n. Возвращает имя."""
+    if n not in UNDERLAY_SLOTS:
+        raise ValueError(f"Ячейка {n} недоступна (1..4)")
+    dst = _slot_path(n)
+    shutil.copy2(src, dst)
+    meta = _load_slot_meta()
+    base = safe_basename(name or Path(src).stem, f"slot{n}")
+    meta[str(n)] = {
+        "name": base,
+        "saved": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    _save_slot_meta(meta)
+    return base
+
+
+def load_underlay_slot(n: int, dest: str) -> str:
+    """Копирует ячейку n в dest. Возвращает имя."""
+    slots = list_underlay_slots()
+    if n not in slots:
+        raise FileNotFoundError(f"Ячейка {n} пуста")
+    shutil.copy2(slots[n]["path"], dest)
+    return slots[n]["name"]
+
+
+def delete_underlay_slot(n: int) -> str:
+    """Удаляет ячейку n. Возвращает имя удалённого или ''."""
+    if n not in UNDERLAY_SLOTS:
+        raise ValueError(f"Ячейка {n} недоступна (1..4)")
+    p = _slot_path(n)
+    meta = _load_slot_meta()
+    name = meta.get(str(n), {}).get("name", p.stem)
+    if p.exists():
+        p.unlink()
+    meta.pop(str(n), None)
+    _save_slot_meta(meta)
+    return name or ""
+
+
+def underlay_kb() -> InlineKeyboardMarkup:
+    """Выбор подложки: загрузка / выбор ячейки / удаление."""
+    slots = list_underlay_slots()
+    rows = []
+    # ряд выбора (загрузить из ячейки)
+    row = []
+    for n in UNDERLAY_SLOTS:
+        if n in slots:
+            label = f"📂{n}:{slots[n]['name'][:12]}"
+            row.append(InlineKeyboardButton(
+                text=label, callback_data=f"ul_load_{n}",
+            ))
+        else:
+            row.append(InlineKeyboardButton(
+                text=f"📂{n}:пусто", callback_data=f"ul_empty_{n}",
+            ))
+    rows.append(row)
+    # ряд удаления заполненных
+    del_row = []
+    for n in UNDERLAY_SLOTS:
+        if n in slots:
+            del_row.append(InlineKeyboardButton(
+                text=f"🗑{n}", callback_data=f"ul_del_{n}",
+            ))
+    if del_row:
+        rows.append(del_row)
+    rows.append([
+        InlineKeyboardButton(
+            text="📎 Загрузить DXF файлом",
+            callback_data="ul_upload",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def save_slot_kb() -> InlineKeyboardMarkup:
+    """Сохранение текущей подложки в ячейку 1–4."""
+    slots = list_underlay_slots()
+    row = []
+    for n in UNDERLAY_SLOTS:
+        mark = "✓" if n in slots else "·"
+        row.append(InlineKeyboardButton(
+            text=f"💾{n}{mark}",
+            callback_data=f"ul_save_{n}",
+        ))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
 
 @dataclass
 class CSReport:
@@ -118,39 +250,24 @@ def check_cs(txt_points, dxf_segments, shift=(0.0, 0.0)) -> CSReport:
 
 
 def cs_text(rep: CSReport, shift=(0.0, 0.0), swapped: bool = False) -> str:
-    sx, sy = shift
     gain = rep.direct / max(rep.swapped, 1e-6)
-    orient = "🔄 X↔Y уже применена" if swapped else "X→X, Y→Y (исходная)"
-
+    orient = "X↔Y" if swapped else "исходная"
     lines = [
-        "🔎 *Модуль 0 · проверка СК* (до расчёта отклонений):",
-        f"Текущая ориентация TXT: *{orient}*.",
-        f"• как сейчас: медиана до контура *{rep.direct:,.1f} м*",
-        f"• если инвертировать `X↔Y`: *{rep.swapped:,.1f} м*",
-        f"Центры: TXT `{rep.c_txt[0]:,.1f}; {rep.c_txt[1]:,.1f}` → "
-        f"инверсия `{rep.c_txt_sw[0]:,.1f}; {rep.c_txt_sw[1]:,.1f}` ↔ "
-        f"DXF `{rep.c_dxf[0]:,.1f}; {rep.c_dxf[1]:,.1f}` "
-        f"(SHIFT `{sx:,.3f}; {sy:,.3f}`).",
+        f"🔎 *СК*: {orient}. медиана *{rep.direct:,.1f} м* "
+        f"(X↔Y → *{rep.swapped:,.1f} м*).",
     ]
-
     if rep.ok:
-        lines.append(f"✅ СК рядом (порог {NEAR_M:.0f} м) — иду в превью.")
+        lines.append(f"✅ Рядом (≤{NEAR_M:.0f} м) → превью.")
     elif rep.suggest_swap:
         lines.append(
-            f"⚠️ Похоже, оси переставлены: инверсия лучше в *{gain:.0f}×*.\n"
-            "*🔄 Поменять X↔Y* переключит столбцы `X`/`Y` только в TXT "
-            "(`H` и `SHIFT` не трогаю) и сразу перепроверит.\n"
-            "🔁 *Перепроверить СК* — без перезаливки файлов."
+            f"⚠️ Оси переставлены (лучше в *{gain:.0f}×*). "
+            "🔄 Поменять X↔Y / 🔁 Перепроверить / Оставить."
         )
     else:
         lines.append(
-            f"⚠️ Не рядом никак (оба ≫ {NEAR_M:.0f} м). Нужен `X0 Y0` — "
-            "привязка нуля DXF в осях DXF. Авто-центрирование не делаю: "
-            "оно обнулило бы само отклонение.\n"
-            "✏️ *Ввести X0 Y0*, 🔁 *Перепроверить СК*, "
-            "*Оставить как есть* — с предупреждением."
+            f"⚠️ Далеко (≫{NEAR_M:.0f} м). Нужен `X0 Y0`. "
+            "✏️ Ввести / 🔁 Перепроверить / Оставить."
         )
-
     return "\n".join(lines)
 
 
@@ -1821,56 +1938,20 @@ def build_scene(data: dict):
 def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
     npair = sum(1 for f in flags if f["pair"])
     head = [
-        f"Готово. Точек *{len(rows)}*, подписей *{len(flags)}* "
-        f"(пар В/Н — *{npair}*), полилиний *{len(dxf.polylines)}*, {dxf.scale_note}.",
-        f"СК: *{'🔄 X↔Y применена' if swapped else 'без перестановки'}*.",
-        f"*В/Н определены приложением*: пар по ΔH≥{txt.pair_z:.2f} м — "
-        f"*{marks['pairs']}*, одиночных — *{marks['alone']}*. Порог H "
-        f"*{marks['thr']:+.3f}* ({marks['src']}). Вводить В/Н в TXT не надо.",
-        "📐 Подписи `В/Н` и цифры ставятся **в более свободную сторону** "
-        "от исходной линии, но **рядом с ней**; при тесноте — небольшой сдвиг "
-        "поперёк/вдоль выбранной стороны.",
-        f"Размер крестиков *{pt_label(txt.pt_k)}*; **буквы и цифры ×{TEXT_SCALE:.0f}, "
-        f"высота поднята**, `В` и цифра **на одной базе**.",
-        f"🎨 **Всё чёрное**; **красным только |Δ| > {txt.red_mm:.0f} мм** "
-        f"(`# REDLIM`). ❗ в чате — по `TOL={txt.tol_mm:.0f} мм`.",
-        "Оформление: тонкий серый контур без штриховки, короткая чёрная стрелка "
-        "стандартного размера от кромки в выбранную свободную сторону, "
-        "текст перпендикулярен полилинии (плита → 90°, стена → 0°). "
-        "Выносок, рамки, номера точки и черты под цифрами нет. "
-        "Одна подпись на грань. Только плановые смещения, мм.",
-        f"Кириллица: DXF-стиль `CYR` ({DXF_CYR_FONT}) + `rotation`; "
-        "в PDF глифы повёрнуты как вектор.",
+        f"✅ Точек *{len(rows)}*, подписей *{len(flags)}* "
+        f"(пар *{npair}*), {dxf.scale_note}. "
+        f"СК: *{'X↔Y' if swapped else 'ок'}*. "
+        f"Крестики *{pt_label(txt.pt_k)}*, красный >*{txt.red_mm:.0f} мм*.",
     ]
-
     if warn:
-        head.insert(1, warn)
-    if not dxf.has_z:
-        head.append("ℹ️ В DXF нет разных `Z`: ярус взят из `H` TXT.")
-    else:
-        dzmed = statistics.median(r["dz"] for r in rows)
-        if dzmed > max(1.0, txt.level_tol * 20):
-            head.append(
-                f"ℹ️ Разные системы высот (median ΔZ={dzmed:.2f} м) — "
-                "на Δплан не влияет."
-            )
-    if any(r["mismatch"] for r in rows):
-        head.append(
-            "ℹ️ Часть точек не попала в допуск яруса — взято ближайшее Z."
-        )
-
+        head.append(warn)
     head.append("")
-    for f in flags[:10]:
-        lines = " / ".join(
-            f"{a} {c} мм"
-            for a, c, _ in f["lines"]
-        )
+    for f in flags[:8]:
+        lines = " / ".join(f"{a} {c}" for a, c, _ in f["lines"])
         bad = " ❗" if any(r["over"] for r in f["rows"]) else ""
         head.append(f"{lines}{bad}")
-    if len(flags) > 10:
-        head.append(
-            f"… и ещё {len(flags) - 10} подписей — все на схеме."
-        )
+    if len(flags) > 8:
+        head.append(f"… +{len(flags) - 8} на схеме")
     return "\n".join(head)
 
 
@@ -1886,37 +1967,21 @@ def preview_caption(
     name_mode="auto",
 ):
     npair = sum(1 for f in flags if f["pair"])
-    mode = "*Авто*" if name_mode == "auto" else "*своё*"
-
+    mode = "Авто" if name_mode == "auto" else "своё"
     return (
-        f"🖼 *PNG-превью* (до сборки файлов)\n"
-        f"Точек *{len(rows)}*, подписей *{len(flags)}* (пар В/Н — *{npair}*).\n"
-        f"Подписи уходят **в более свободную сторону от линии**, оставаясь рядом "
-        f"с исходной полилинией. `В` и цифра **одной высоты, на одной базе**. "
-        f"**Всё чёрное, красным только |Δ| > {txt.red_mm:.0f} мм**.\n"
-        f"📁 Имя файлов: {mode} → `{md_code(stem)}.dxf` / `{md_code(stem)}.pdf`.\n"
-        f"СК: *{'🔄 X↔Y' if swapped else 'без перестановки'}*. "
-        f"В/Н автоматически, порог H *{marks['thr']:+.3f}*.\n"
-        f"Крестики *{pt_label(txt.pt_k)}* — кнопки перерисуют превью, "
-        f"затем *✅ Собрать DXF + PDF*."
+        f"🖼 Превью: *{len(rows)}* тчк, *{len(flags)}* подп. (пар *{npair}*). "
+        f"Красный >*{txt.red_mm:.0f} мм*. "
+        f"📁 `{md_code(stem)}` ({mode}). "
+        f"СК: *{'X↔Y' if swapped else 'ок'}*. "
+        f"Крестики *{pt_label(txt.pt_k)}* → *✅ Собрать*."
         + (f"\n{warn}" if warn else "")
     )
 
 
 def sample_caption(ptk):
     return (
-        "📐 *Образец*: горизонтальная плита + вертикальная стена.\n"
-        "• подписи `В/Н` и цифры стараются встать **в более свободную "
-        "сторону от линии**, но рядом с исходной кромкой;\n"
-        "• `В  +25` — цифра красная (|Δ| > 20 мм), буква `В` чёрная;\n"
-        "• `Н  +12`, `В  +8`, `Н  0` — полностью чёрные;\n"
-        "• `В` и цифра одной высоты и на одной базе;\n"
-        "• текст перпендикулярен полилинии, стрелка короткая стандартная, "
-        "крестик в точке.\n"
-        "Нет выносок, рамки, номера, черты под цифрами, штриховки. "
-        f"Текст ×{TEXT_SCALE:.0f}, высота поднята. "
-        "`В/Н` ставится приложением по `H`.\n\n"
-        f"Размер крестиков/стрелок *{pt_label(ptk)}* — кнопками *до* ввода файлов."
+        f"📐 Образец. `В`/`Н` + цифры одной высоты, стрелка по смещению. "
+        f"Крестики *{pt_label(ptk)}* — кнопками. Затем TXT."
     )
 
 
@@ -1983,18 +2048,36 @@ def preview_kb(ptk, stem="", name_mode="auto"):
 
 
 def final_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
+    slots = list_underlay_slots()
+    save_row = []
+    del_row = []
+    for n in UNDERLAY_SLOTS:
+        mark = "✓" if n in slots else "·"
+        save_row.append(InlineKeyboardButton(
+            text=f"💾{n}{mark}",
+            callback_data=f"ul_save_{n}",
+        ))
+        if n in slots:
+            del_row.append(InlineKeyboardButton(
+                text=f"🗑{n}",
+                callback_data=f"ul_del_{n}",
+            ))
+    rows = [
         [
             InlineKeyboardButton(text="📐 DXF", callback_data="get_dxf"),
             InlineKeyboardButton(text="📄 PDF", callback_data="get_pdf"),
         ],
-        [
-            InlineKeyboardButton(
-                text="▶️ Продолжим новый файл",
-                callback_data="pv_restart",
-            ),
-        ],
+        save_row,
+    ]
+    if del_row:
+        rows.append(del_row)
+    rows.append([
+        InlineKeyboardButton(
+            text="▶️ Новый файл",
+            callback_data="pv_restart",
+        ),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ─────────────────────────── Бот ───────────────────────────
@@ -2074,35 +2157,9 @@ async def start(msg: types.Message, state: FSMContext):
     )
 
     await msg.answer(
-        "Пришлите *TXT* как есть, прямо из тахеометра:\n"
-        "`0,9505.1690,2865.1403,169.0364,,,,,,,,,,,`\n"
-        "`1,9500.9927,2867.6485,167.6719,,,,,,,,,,,`\n"
-        "`2,9500.9936,2867.6472,170.4933,,,,,,,,,,,`\n\n"
-        "✅ **В/Н писать НЕ надо** — близкие по `XY` точки с `ΔH ≥ PAIRZ` "
-        "→ пара, меньшая `H` = `Н`, большая = `В`. На грань — одна подпись.\n"
-        "🎯 Подписи и цифры ставятся **в более свободную сторону от линии**, "
-        "но рядом с исходной полилинией. `В` и цифра одной высоты и на одной "
-        f"базе; всё чёрное, красным только |Δ| > {RED_MM:.0f} мм. "
-        f"Текст ⟂ полилинии, стрелка стандартная, ×{TEXT_SCALE:.0f}.\n"
-        f"⚠️ *DXF — не больше {DXF_MAX_MB} МБ* ({DXF_MAX_BYTES:,} байт).\n"
-        "📁 В превью: *📝 Имя* или *🤖 Авто*. "
-        "В конце — *▶️ Продолжим новый файл*.\n"
-        "✅ Хвост `,,,,`, десятичная точка, `;`, пробел, таб, запятая с "
-        "пробелами и десятичная запятая — принимаются.\n"
-        "⚠️ Не разбивайте число пробелом и не пишите `9505,1690,2865,1403` "
-        "через одни запятые.\n\n"
-        "🔎 После TXT+DXF *Модуль 0* сверит СК: рядом → превью; "
-        f"инверсия `X↔Y` лучше в ≥*{SWAP_RATIO:.0f}×* → кнопка; "
-        f"не рядом → `X0 Y0`. 🔁 *Перепроверить СК* — без перезаливки.\n\n"
-        "Строки с `#`:\n"
-        "`# SHIFT=X0 Y0` — нуль DXF в осях DXF\n"
-        "`# DXFUNITS=mm`, `# UNITS=mm`\n"
-        "`# TOL=10` — допуск плана (только ❗ в чате), мм\n"
-        f"`# REDLIM={RED_MM:.0f}` — порог красных цифр, мм\n"
-        "`# PAIRR=0.30`, `# PAIRZ=0.50` — пара по XY и по ΔH\n"
-        "`# LEVELTOL=0.05` — привязка контура по Z\n"
-        "`# PTS=1.25` — размер крестиков/стрелок (или кнопки выше)\n\n"
-        "Затем *DXF* → проверка СК → PNG-превью → *✅ Собрать* → **DXF + PDF**.",
+        "Пришлите *TXT* (точки). В/Н писать не надо.\n"
+        f"Затем DXF (≤*{DXF_MAX_MB} МБ*) или ячейка подложки 1–4.\n"
+        f"`# TOL=10` `# REDLIM={RED_MM:.0f}` `# SHIFT=X0 Y0` `# PTS=1.25`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -2154,12 +2211,11 @@ async def on_txt(msg: types.Message, state: FSMContext):
     await state.set_state(Form.wait_dxf)
 
     await msg.answer(
-        f"TXT принят: точек *{len(txt.points)}*, H "
-        f"*{min(hs):.3f}…{max(hs):.3f}*, допуск *{txt.tol_mm:.0f} мм*, "
-        f"красный порог *{txt.red_mm:.0f} мм*, PAIRZ *{txt.pair_z:.2f} м*, "
-        f"крестики *{pt_label(pt_k)}*, подписи ×{TEXT_SCALE:.0f}.\n"
-        f"Пришлите *DXF* (до *{DXF_MAX_MB} МБ*).",
+        f"TXT: *{len(txt.points)}* тчк, H *{min(hs):.3f}…{max(hs):.3f}*, "
+        f"TOL *{txt.tol_mm:.0f}*, RED *{txt.red_mm:.0f}*.\n"
+        f"Подложка: файл DXF (≤*{DXF_MAX_MB} МБ*) или ячейка 1–4.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=underlay_kb(),
     )
 
 
@@ -2230,8 +2286,91 @@ async def on_dxf(msg: types.Message, state: FSMContext):
 @dp.message(Form.wait_dxf)
 async def need_dxf(msg: types.Message):
     await msg.answer(
-        f"Пришлите файл `.dxf` с полилиниями проекта "
-        f"(не больше *{DXF_MAX_MB} МБ*).",
+        f"DXF-файл (≤*{DXF_MAX_MB} МБ*) или ячейка подложки 1–4.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=underlay_kb(),
+    )
+
+
+@dp.callback_query(F.data == "ul_upload")
+async def ul_upload(c: types.CallbackQuery, state: FSMContext):
+    await c.answer()
+    await c.message.answer(
+        f"Пришлите файл `.dxf` (≤*{DXF_MAX_MB} МБ*).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@dp.callback_query(F.data.startswith("ul_empty_"))
+async def ul_empty(c: types.CallbackQuery):
+    n = c.data.split("_")[-1]
+    await c.answer(f"Ячейка {n} пуста — загрузите DXF файлом", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("ul_del_"))
+async def ul_del(c: types.CallbackQuery, state: FSMContext):
+    n = int(c.data.split("_")[-1])
+    try:
+        name = delete_underlay_slot(n)
+    except Exception as e:
+        await c.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    await c.answer(f"Ячейка {n} очищена")
+    await c.message.answer(
+        f"🗑 Ячейка *{n}* удалена" + (f": `{md_code(name)}`" if name else ""),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=underlay_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("ul_load_"))
+async def ul_load(c: types.CallbackQuery, state: FSMContext):
+    n = int(c.data.split("_")[-1])
+    data = await state.get_data()
+    tmp = data.get("tmp")
+    if not tmp:
+        await c.answer("Сначала /start", show_alert=True)
+        return
+    dest = os.path.join(tmp, "proj.dxf")
+    try:
+        name = load_underlay_slot(n, dest)
+    except Exception as e:
+        await c.answer(f"Ошибка: {e}", show_alert=True)
+        return
+
+    await state.update_data(
+        dxf_path=dest,
+        dxf_name=f"{name}.dxf",
+        shift_checked=False,
+        swap_xy=False,
+        cs_done=False,
+    )
+    await c.answer(f"Подложка {n}: {name}")
+    await c.message.answer(
+        f"📂 Ячейка *{n}* → `{md_code(name)}`. Сверяю СК…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await run_cs_check(c.message, state, force=True)
+
+
+@dp.callback_query(F.data.startswith("ul_save_"))
+async def ul_save(c: types.CallbackQuery, state: FSMContext):
+    n = int(c.data.split("_")[-1])
+    data = await state.get_data()
+    src = data.get("dxf_path")
+    if not src or not os.path.exists(src):
+        await c.answer("Нет текущего DXF", show_alert=True)
+        return
+    try:
+        name = save_underlay_slot(
+            n, src, data.get("dxf_name") or Path(src).stem,
+        )
+    except Exception as e:
+        await c.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    await c.answer(f"Сохранено в ячейку {n}: {name}")
+    await c.message.answer(
+        f"💾 Подложка сохранена в ячейку *{n}*: `{md_code(name)}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -2695,18 +2834,8 @@ async def pv_build(c: types.CallbackQuery, state: FSMContext):
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── ВАЖНО: caption — обычная строка, НЕ кортеж ──
-    dxf_caption = (
-        f"{stem}.dxf — PROJ / FACT / ARROW / LEAD / TAG, метры, "
-        "$INSUNITS=6, свободная сторона, текст ⟂ полилинии, "
-        f"красный только >{txt.red_mm:.0f} мм"
-    )
-
-    pdf_caption = (
-        f"{stem}.pdf — `В +25` / `Н +12` на одной базе, "
-        f"расстановка по свободной стороне, ×{TEXT_SCALE:.0f}, "
-        f"чёрное + красный >{txt.red_mm:.0f} мм"
-    )
+    dxf_caption = f"{stem}.dxf — отклонения, стрелки, красный >{txt.red_mm:.0f} мм"
+    pdf_caption = f"{stem}.pdf — В/Н + цифры, красный >{txt.red_mm:.0f} мм"
 
     await c.message.answer_document(
         FSInputFile(out_dxf, filename=f"{stem}.dxf"),
