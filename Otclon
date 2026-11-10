@@ -1167,14 +1167,14 @@ def make_flags(rows, txt, dxf, off):
             or sorted(g, key=pid_sort)[:1]
         )
 
-    # Размеры подписи. Буква и цифра одной высоты (scale по высоте).
-    # Допускается лёгкое наложение буквы и цифры.
+    # Размеры подписи. Буква и цифра одной высоты, стоят друг за другом.
+    # Небольшое смещение от точки (от наконечника стрелки).
     ch = off * 0.62 * TEXT_SCALE
     lw = ch * 0.90          # ширина под букву
-    vw = ch * 2.60          # ширина под цифру (±xx)
+    vw = ch * 2.50          # ширина под цифру (±xx)
     w = lw + vw
     pad = ch * 0.18
-    gap = ch * 0.18         # небольшой отступ после наконечника (стрелка длиннее)
+    gap = ch * 0.12         # небольшое смещение от наконечника / точки
 
     # Небольшие смещения вдоль нормали / вдоль линии — чтобы развести соседей,
     # но не уносить далеко от полилинии.
@@ -1386,28 +1386,34 @@ def _text_path_cached(s: str):
 @lru_cache(maxsize=2048)
 def _flag_pair_cached(letter: str, val: str):
     """
-    Буква + цифра на одной базовой линии, ОДИНАКОВОЙ высоты.
-    Оба глифа нормализованы к высоте 1.0 → один масштаб.
-    Небольшой gap (можно слегка накладываться) — читается как пара.
+    Буква + цифра СТРОГО одной высоты, на одной базовой линии.
+    Оба глифа рисуются с одним font size, выравниваются по baseline,
+    затем общий масштаб подгоняет пару под target_h.
     """
     tl, x0l, wl, hl = _text_path_cached(letter)
     tv, x0v, wv, hv = _text_path_cached(val)
 
-    # нормализуем каждый глиф к высоте 1 — буква и цифра одной высоты
-    kl = 1.0 / max(hl, 1e-6)
-    kv = 1.0 / max(hv, 1e-6)
+    # Общая опорная высота = max(hl, hv) — оба глифа масштабируем
+    # одинаково, чтобы визуальная высота совпадала точно.
+    href = max(hl, hv, 1e-6)
+    k_common = 1.0 / href
 
-    # маленький зазор: допускается лёгкое наложение
-    gap = 0.06
+    # маленький зазор между буквой и цифрой
+    gap = 0.08 * href  # в единицах исходного size=1.0
 
+    # оба: сдвиг к x=0, вниз на свой y0 (baseline), общий scale
     p_l = tl.transformed(
-        Affine2D().translate(-x0l, 0.0).scale(kl, kl)
+        Affine2D()
+        .translate(-x0l, 0.0)
+        .scale(k_common, k_common)
     )
+    # ширина буквы после scale
+    w_letter = wl * k_common
     p_v = tv.transformed(
         Affine2D()
         .translate(-x0v, 0.0)
-        .scale(kv, kv)
-        .translate(wl * kl + gap, 0.0)
+        .scale(k_common, k_common)
+        .translate(w_letter + gap * k_common, 0.0)
     )
 
     bl, bv = p_l.get_extents(), p_v.get_extents()
@@ -1417,7 +1423,7 @@ def _flag_pair_cached(letter: str, val: str):
     ymax = max(bl.y1, bv.y1)
 
     total_w = max(xmax - xmin, 1e-6)
-    total_h = max(ymax - ymin, 1e-6)  # ≈ 1.0
+    total_h = max(ymax - ymin, 1e-6)
     local_cx = (xmin + xmax) / 2.0
     local_cy = (ymin + ymax) / 2.0
 
@@ -1441,16 +1447,10 @@ def draw_flag_line(
         str(val),
     )
 
-    # Буква и цифра — одинаковой высоты (scale только по высоте).
-    # Ширину почти не ограничиваем: допускается выход за ячейку и
-    # лёгкое наложение буквы/цифры.
+    # СТРОГО одна высота: масштаб только по высоте пары.
+    # Ширину не режем — буква и цифра остаются одной высоты.
     target_h = cell_h * TEXT_FILL
     k = target_h / max(th, 1e-6)
-
-    # если пара слишком широкая — слегка поджимаем, но не сильнее 15%
-    max_w = w * 1.25
-    if tw * k > max_w:
-        k = max(k * 0.85, max_w / max(tw, 1e-6))
 
     cx = x0 + w / 2.0
     cy = y0 + cell_h / 2.0
