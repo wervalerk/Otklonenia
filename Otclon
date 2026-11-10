@@ -1017,22 +1017,62 @@ def _perp_normal(seg, prefer=None):
     return (nx, ny)
 
 
+def offset_dir_row(r, dxf):
+    """
+    Направление стрелки для ОДНОЙ точки:
+    перпендикуляр к полилинии в сторону смещения (знак dp / p−q).
+    """
+    s = _safe_segment(dxf, r)
+    prefer = (r["p"][0] - r["q"][0], r["p"][1] - r["q"][1])
+    if math.hypot(*prefer) < 1e-9:
+        prefer = (1.0, 0.0) if r.get("dp", 0.0) >= 0 else (-1.0, 0.0)
+    return _perp_normal(s, prefer)
+
+
 def offset_dir(rows_subset, dxf):
     """
-    Направление стрелки / сдвига подписи:
-    ВСЕГДА перпендикулярно полилинии (90°), в сторону фактической точки
-    (или в сторону dp, если точка почти на линии).
+    Направление подписи/«главной» стрелки для группы:
+    перпендикуляр к полилинии, в сторону первой точки.
     """
-    r0 = rows_subset[0]
-    s = _safe_segment(dxf, r0)
+    return offset_dir_row(rows_subset[0], dxf)
 
-    # предпочтение: куда лежит точка относительно q
-    prefer = (r0["p"][0] - r0["q"][0], r0["p"][1] - r0["q"][1])
-    if math.hypot(*prefer) < 1e-9:
-        # точка почти на линии — по знаку dp
-        prefer = (1.0, 0.0) if r0.get("dp", 0.0) >= 0 else (-1.0, 0.0)
 
-    return _perp_normal(s, prefer)
+def _pair_arrows(ordered, dxf, off, ptk):
+    """
+    Стрелки для группы. Для пары В/Н — ДВЕ стрелки рядом:
+    каждая в сторону своего смещения (разные знаки → разнонаправленно).
+    """
+    n = len(ordered)
+    if n == 0:
+        return []
+
+    # касательная к сегменту — чтобы поставить стрелки рядом вдоль линии
+    s = _safe_segment(dxf, ordered[0])
+    if s is not None:
+        ex, ey = s.bx - s.ax, s.by - s.ay
+        el = math.hypot(ex, ey) or 1.0
+        tx, ty = ex / el, ey / el
+    else:
+        tx, ty = 1.0, 0.0
+
+    # среднее q как центр
+    qx = sum(r["q"][0] for r in ordered) / n
+    qy = sum(r["q"][1] for r in ordered) / n
+
+    # расстояние между соседними стрелками
+    spacing = off * 0.40 * ptk
+
+    arrows = []
+    for i, r in enumerate(ordered):
+        u = offset_dir_row(r, dxf)
+        if n == 1:
+            qi = (r["q"][0], r["q"][1])
+        else:
+            # симметрично относительно центра: … -1.5, -0.5, +0.5, +1.5 …
+            shift = (i - (n - 1) / 2.0) * spacing
+            qi = (qx + tx * shift, qy + ty * shift)
+        arrows.append(standard_arrow(qi, u, off, ptk))
+    return arrows
 
 
 def text_angle(rows_subset, dxf, u=None) -> float:
@@ -1435,7 +1475,8 @@ def make_flags(rows, txt, dxf, off):
                         "q": q,
                         "u": d,
                         "angle": theta,
-                        "arrow": ar,
+                        "arrow": ar,  # главная (для совместимости)
+                        "arrows": None,  # заполним после выбора
                         "box": box,
                         "cbox": cbox,
                         "ch": ch,
@@ -1458,6 +1499,13 @@ def make_flags(rows, txt, dxf, off):
             free or candidates,
             key=lambda c: c[0],
         )
+
+        # Для пары — 2 стрелки рядом, каждая по знаку своего dp
+        best_flag["arrows"] = _pair_arrows(
+            ordered, dxf, off, txt.pt_k,
+        )
+        if best_flag["arrows"]:
+            best_flag["arrow"] = best_flag["arrows"][0]
 
         occupied.append(best_flag["cbox"])
         flags.append(best_flag)
@@ -1643,31 +1691,31 @@ def render_scene(ax, dxf, rows, flags, txt):
             zorder=3,
         )
 
-    # 3) стандартная стрелка + подпись на одной базе
+    # 3) стрелки (для пары В/Н — две, каждая по знаку своего смещения) + подписи
     for f in flags:
-        ar = f["arrow"]
-
-        ax.plot(
-            [ar["start"][0], ar["end"][0]],
-            [ar["start"][1], ar["end"][1]],
-            color=INK,
-            lw=0.30,
-            zorder=4,
-        )
-        ax.plot(
-            [ar["end"][0], ar["a1"][0]],
-            [ar["end"][1], ar["a1"][1]],
-            color=INK,
-            lw=0.30,
-            zorder=4,
-        )
-        ax.plot(
-            [ar["end"][0], ar["a2"][0]],
-            [ar["end"][1], ar["a2"][1]],
-            color=INK,
-            lw=0.30,
-            zorder=4,
-        )
+        arrows = f.get("arrows") or [f["arrow"]]
+        for ar in arrows:
+            ax.plot(
+                [ar["start"][0], ar["end"][0]],
+                [ar["start"][1], ar["end"][1]],
+                color=INK,
+                lw=0.30,
+                zorder=4,
+            )
+            ax.plot(
+                [ar["end"][0], ar["a1"][0]],
+                [ar["end"][1], ar["a1"][1]],
+                color=INK,
+                lw=0.30,
+                zorder=4,
+            )
+            ax.plot(
+                [ar["end"][0], ar["a2"][0]],
+                [ar["end"][1], ar["a2"][1]],
+                color=INK,
+                lw=0.30,
+                zorder=4,
+            )
 
         x0, y0, _, _ = f["box"]
         row_h = f["row_h"]
@@ -1705,13 +1753,13 @@ def render_scene(ax, dxf, rows, flags, txt):
             (x0, y0),
             (x0 + bw, y0 + bh),
         ])
-        ar = f["arrow"]
-        ax.update_datalim([
-            ar["start"],
-            ar["end"],
-            ar["a1"],
-            ar["a2"],
-        ])
+        for ar in (f.get("arrows") or [f["arrow"]]):
+            ax.update_datalim([
+                ar["start"],
+                ar["end"],
+                ar["a1"],
+                ar["a2"],
+            ])
 
     ax.autoscale_view()
     ax.set_aspect("equal", adjustable="datalim")
