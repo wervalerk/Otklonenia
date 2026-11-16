@@ -732,9 +732,64 @@ class DxfData:
     scale_note: str
     has_z: bool
     level_reps: List[float]
+    # отверстия (внутренние замкнутые контуры) — список индексов сегментов
+    # и сами полигоны (только XY) для point-in-poly
+    openings: List[dict] = field(default_factory=list)
+    # индекс сегментов внешнего контура (самый большой по площади)
+    outer_seg_idx: List[int] = field(default_factory=list)
 
 
 SUPPORTED = {"LWPOLYLINE", "POLYLINE", "LINE", "ARC"}
+
+
+def _shoelace_area(pts: List[Tuple[float, float, float]]) -> float:
+    """Площадь полигона по XY (абсолютная), м²."""
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    a = 0.0
+    for i in range(n):
+        x1, y1 = pts[i][0], pts[i][1]
+        x2, y2 = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        a += x1 * y2 - x2 * y1
+    return abs(a) * 0.5
+
+
+def _point_in_poly(x: float, y: float, pts: List[Tuple[float, float, float]]) -> bool:
+    """Ray-casting: точка внутри полигона (XY)."""
+    n = len(pts)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i][0], pts[i][1]
+        xj, yj = pts[j][0], pts[j][1]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _dist_to_poly(x: float, y: float, pts: List[Tuple[float, float, float]]) -> float:
+    """Минимальное расстояние от точки до рёбер полигона."""
+    best = 1e30
+    n = len(pts)
+    for i in range(n):
+        ax, ay = pts[i][0], pts[i][1]
+        bx, by = pts[(i + 1) % n][0], pts[(i + 1) % n][1]
+        vx, vy = bx - ax, by - ay
+        L2 = vx * vx + vy * vy
+        if L2 < 1e-18:
+            d = math.hypot(x - ax, y - ay)
+        else:
+            t = max(0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / L2))
+            d = math.hypot(x - (ax + t * vx), y - (ay + t * vy))
+        if d < best:
+            best = d
+    return best
 
 
 def walk(entities, depth=0):
@@ -872,22 +927,56 @@ def parse_dxf(path, shift, dxfunits_override, level_tol) -> DxfData:
 
     dx, dy = shift
     polylines, segments, contour_z = [], [], []
+    # (start_idx, end_idx_exclusive, closed, pts_m, area) для классификации
+    poly_meta = []
 
     for r in raw:
         pts_m = [
             (x * scale + dx, y * scale + dy, z * scale)
             for x, y, z in r["pts"]
         ]
-        contour_z.append(sum(p[2] for p in pts_m) / len(pts_m))
-        polylines.append((pts_m, r["closed"], r["layer"]))
+        contour_z.append(sum(p[2] for p in pts_m) / len(pts_m) if pts_m else 0.0)
+        closed = bool(r["closed"])
+        polylines.append((pts_m, closed, r["layer"]))
 
+        start_si = len(segments)
         for a, b in zip(pts_m, pts_m[1:]):
             if (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2 < 1e-18:
                 continue
             segments.append(Seg(*a, *b, r["layer"]))
+        # ВАЖНО: для замкнутых контуров (отверстия!) добавляем замыкающий сегмент
+        if closed and len(pts_m) >= 3:
+            a, b = pts_m[-1], pts_m[0]
+            if (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2 >= 1e-18:
+                segments.append(Seg(*a, *b, r["layer"]))
+        end_si = len(segments)
+        area = _shoelace_area(pts_m) if closed else 0.0
+        poly_meta.append((start_si, end_si, closed, pts_m, area))
 
     if not segments:
         raise ValueError("После приведения единиц не осталось отрезков.")
+
+    # ─── классификация: внешний контур + отверстия ───
+    # Самый большой по площади замкнутый = плита (outer).
+    # Остальные замкнутые с площадью ≥ 0.25 м² = отверстия (лестницы, лифты, шахты…).
+    OPENING_MIN_AREA = 0.25  # м²
+    closed_metas = [(i, m) for i, m in enumerate(poly_meta) if m[2] and m[4] >= OPENING_MIN_AREA]
+    outer_seg_idx: List[int] = []
+    openings: List[dict] = []
+
+    if closed_metas:
+        # outer = max area
+        outer_i, outer_m = max(closed_metas, key=lambda t: t[1][4])
+        outer_seg_idx = list(range(outer_m[0], outer_m[1]))
+        for i, m in closed_metas:
+            if i == outer_i:
+                continue
+            openings.append({
+                "seg_idx": list(range(m[0], m[1])),
+                "pts": m[3],
+                "area": m[4],
+                "layer": polylines[i][2] if i < len(polylines) else "",
+            })
 
     distinct = {round(z, 3) for z in contour_z}
     has_z = len(distinct) > 1 or any(abs(z) > 1e-9 for z in contour_z)
@@ -898,19 +987,59 @@ def parse_dxf(path, shift, dxfunits_override, level_tol) -> DxfData:
         note,
         has_z,
         cluster_levels(contour_z, level_tol) if has_z else [],
+        openings=openings,
+        outer_seg_idx=outer_seg_idx,
     )
 
 
 # ─────────────── Расчёт ТОЛЬКО плановых смещений ───────────────
 
 def compute(txt: TxtData, dxf: DxfData):
+    """
+    Плановые отклонения от полилиний DXF.
+
+    Особый режим для отверстий (как на образцах ИГС):
+    - если точка лежит внутри отверстия или ближе 0.9 м к его контуру,
+      проекция выполняется ТОЛЬКО на сегменты этого отверстия;
+    - иначе — на все сегменты (внешний контур + остальное).
+    Это не даёт точкам с края лестничной клетки «прилипать» к дальнему
+    наружному контуру плиты.
+    """
+    OPENING_NEAR_M = 0.90  # м — порог «принадлежит отверстию»
+
     rows = []
     for pid, x, y, h in txt.points:
+        # 1) Определяем, к какому отверстию (если к какому-то) относится точка
+        preferred_si: Optional[set] = None
+        opening_id = None
+        if dxf.openings:
+            best_op = None
+            best_d = OPENING_NEAR_M + 1.0
+            for oi, op in enumerate(dxf.openings):
+                d_edge = _dist_to_poly(x, y, op["pts"])
+                inside = _point_in_poly(x, y, op["pts"])
+                # внутри отверстия или очень близко к его границе
+                if inside or d_edge <= OPENING_NEAR_M:
+                    score = 0.0 if inside else d_edge
+                    if score < best_d:
+                        best_d = score
+                        best_op = oi
+            if best_op is not None:
+                preferred_si = set(dxf.openings[best_op]["seg_idx"])
+                opening_id = best_op
+
         same, other = [], []
 
         for si, s in enumerate(dxf.segments):
+            # если точка «от отверстия» — смотрим только его сегменты
+            if preferred_si is not None and si not in preferred_si:
+                continue
+
             vx, vy = s.bx - s.ax, s.by - s.ay
-            t = ((x - s.ax) * vx + (y - s.ay) * vy) / (vx * vx + vy * vy)
+            L2 = vx * vx + vy * vy
+            if L2 < 1e-18:
+                continue
+            t = ((x - s.ax) * vx + (y - s.ay) * vy) / L2
             t = 0.0 if t < 0 else (1.0 if t > 1 else t)
 
             qx, qy = s.ax + t * vx, s.ay + t * vy
@@ -935,6 +1064,30 @@ def compute(txt: TxtData, dxf: DxfData):
             else:
                 other.append(c)
 
+        # если по отверстию ничего не нашли (редкий случай) — fallback на все
+        if preferred_si is not None and not (same or other):
+            preferred_si = None
+            for si, s in enumerate(dxf.segments):
+                vx, vy = s.bx - s.ax, s.by - s.ay
+                L2 = vx * vx + vy * vy
+                if L2 < 1e-18:
+                    continue
+                t = ((x - s.ax) * vx + (y - s.ay) * vy) / L2
+                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+                qx, qy = s.ax + t * vx, s.ay + t * vy
+                qz = s.az + t * (s.bz - s.az)
+                d = math.hypot(x - qx, y - qy)
+                cross = vx * (y - s.ay) - vy * (x - s.ax)
+                dp = (1.0 if cross >= 0 else -1.0) * d * 1000.0
+                c = {
+                    "d": d, "dp": dp, "qx": qx, "qy": qy, "qz": qz,
+                    "dz": abs(qz - h), "layer": s.layer, "si": si,
+                }
+                if not dxf.has_z or c["dz"] <= txt.level_tol:
+                    same.append(c)
+                else:
+                    other.append(c)
+
         if not same and other:
             zmin = min(c["dz"] for c in other)
             same = [c for c in other if c["dz"] <= zmin + txt.level_tol]
@@ -954,6 +1107,7 @@ def compute(txt: TxtData, dxf: DxfData):
             "layer": best["layer"],
             "si": best["si"],
             "over": abs(dp) > txt.tol_mm,
+            "opening_id": opening_id,          # None или индекс отверстия
             "mismatch": bool(
                 dxf.has_z
                 and other
@@ -1048,14 +1202,15 @@ def offset_dir(rows_subset, dxf):
 
 def _pair_arrows(ordered, dxf, off, ptk):
     """
-    Стрелки для группы. Для пары В/Н — ДВЕ стрелки рядом:
+    Стрелки для группы. Для пары В/Н — ДВЕ стрелки рядом на общей базе:
     каждая в сторону своего смещения (разные знаки → разнонаправленно).
+    Не разъезжаются по разным q — всегда общий центр + малый сдвиг вдоль линии.
     """
     n = len(ordered)
     if n == 0:
         return []
 
-    # касательная к сегменту — чтобы поставить стрелки рядом вдоль линии
+    # касательная к сегменту — стрелки ставим рядом вдоль линии
     s = _safe_segment(dxf, ordered[0])
     if s is not None:
         ex, ey = s.bx - s.ax, s.by - s.ay
@@ -1064,20 +1219,20 @@ def _pair_arrows(ordered, dxf, off, ptk):
     else:
         tx, ty = 1.0, 0.0
 
-    # среднее q как центр
+    # одна общая база (не уезжаем к разным q точек)
     qx = sum(r["q"][0] for r in ordered) / n
     qy = sum(r["q"][1] for r in ordered) / n
 
-    # расстояние между соседними стрелками
-    spacing = off * 0.40 * ptk
+    # расстояние между соседними стрелками (×1.2 к прежнему 0.40)
+    spacing = off * 0.48 * ptk
 
     arrows = []
     for i, r in enumerate(ordered):
         u = offset_dir_row(r, dxf)
         if n == 1:
-            qi = (r["q"][0], r["q"][1])
+            qi = (qx, qy)
         else:
-            # симметрично относительно центра: … -1.5, -0.5, +0.5, +1.5 …
+            # симметрично от общего центра — пара всегда рядом
             shift = (i - (n - 1) / 2.0) * spacing
             qi = (qx + tx * shift, qy + ty * shift)
         arrows.append(standard_arrow(qi, u, off, ptk))
@@ -1828,6 +1983,8 @@ def sample_scene(pt_k: float):
         "образец",
         False,
         [],
+        openings=[],
+        outer_seg_idx=list(range(len(segs))),
     )
 
     rows = [
@@ -2024,11 +2181,17 @@ def build_scene(data: dict):
 
 def make_head(txt, dxf, rows, flags, marks, swapped=False, warn=""):
     npair = sum(1 for f in flags if f["pair"])
+    n_open = len(getattr(dxf, "openings", []) or [])
+    n_on_open = sum(1 for r in rows if r.get("opening_id") is not None)
+    open_note = ""
+    if n_open:
+        open_note = f" Отверстий *{n_open}* (точек на них *{n_on_open}*)."
     head = [
         f"✅ Точек *{len(rows)}*, подписей *{len(flags)}* "
         f"(пар *{npair}*), {dxf.scale_note}. "
         f"СК: *{'X↔Y' if swapped else 'ок'}*. "
-        f"Крестики *{pt_label(txt.pt_k)}*, красный >*{txt.red_mm:.0f} мм*.",
+        f"Крестики *{pt_label(txt.pt_k)}*, красный >*{txt.red_mm:.0f} мм*."
+        f"{open_note}",
     ]
     if warn:
         head.append(warn)
@@ -2973,6 +3136,22 @@ async def on_get(c: types.CallbackQuery, state: FSMContext):
         reply_markup=final_kb(),
     )
     await c.answer()
+
+
+# ─── Фолбэк: сообщения вне обработанных FSM-состояний ───
+@dp.message()
+async def fallback_any(msg: types.Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur is None:
+        await msg.answer(
+            "Нет активного сценария. Нажмите /start.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await msg.answer(
+            "Не понял это сообщение. Следуйте подсказкам выше или /start.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 if __name__ == "__main__":
