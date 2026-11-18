@@ -1162,17 +1162,42 @@ def offset_dir(rows_subset, dxf):
     return offset_dir_row(rows_subset[0], dxf)
 
 
+def _arrow_from_segment(start, end, u):
+    """Стрелка по готовым start/end и направлению u (единичный)."""
+    ux, uy = u
+    L = math.hypot(end[0] - start[0], end[1] - start[1]) or 1e-6
+    head = L * 0.42
+    wing = head * 0.45
+    px, py = -uy, ux
+    a1 = (
+        end[0] - ux * head + px * wing,
+        end[1] - uy * head + py * wing,
+    )
+    a2 = (
+        end[0] - ux * head - px * wing,
+        end[1] - uy * head - py * wing,
+    )
+    return {
+        "start": start,
+        "end": end,
+        "a1": a1,
+        "a2": a2,
+        "L": L,
+    }
+
+
 def _pair_arrows(ordered, dxf, off, ptk):
     """
-    Стрелки для группы. Для пары В/Н — ДВЕ стрелки РЯДОМ на одной базе
-    (как на образцах ИС ВК): не разъезжаются по разным q.
-    Разные знаки dp → разнонаправленные, но из почти одной точки на линии.
+    Стрелки для группы.
+    Одинаковый знак — две короткие стрелки рядом в одну сторону.
+    Разные знаки — параллельная пара:
+      начало 1 = конец 2, начало 2 = конец 1 (противоположные направления),
+      с небольшим боковым отступом вдоль линии.
     """
     n = len(ordered)
     if n == 0:
         return []
 
-    # касательная к сегменту — лёгкий сдвиг вдоль линии
     s = _safe_segment(dxf, ordered[0])
     if s is not None:
         ex, ey = s.bx - s.ax, s.by - s.ay
@@ -1181,28 +1206,42 @@ def _pair_arrows(ordered, dxf, off, ptk):
     else:
         tx, ty = 1.0, 0.0
 
-    # строго одна общая база (середина проекций)
     qx = sum(float(r["q"][0]) for r in ordered) / n
     qy = sum(float(r["q"][1]) for r in ordered) / n
+    q = (qx, qy)
 
-    # разнонаправленные? — ещё плотнее, почти одна точка
-    if n >= 2:
-        signs = [1 if float(r.get("dp", 0.0) or 0.0) >= 0 else -1 for r in ordered]
-        opposite = signs[0] != signs[1]
-    else:
-        opposite = False
+    if n == 1:
+        u = offset_dir_row(ordered[0], dxf)
+        return [standard_arrow(q, u, off, ptk)]
 
-    # на образцах пара сидит вплотную; при противоположных знаках — почти 0
-    spacing = off * (0.12 if opposite else 0.20) * ptk
+    u0 = offset_dir_row(ordered[0], dxf)
+    u1 = offset_dir_row(ordered[1], dxf)
+    opposite = (u0[0] * u1[0] + u0[1] * u1[1]) < 0
 
+    L = off * 0.72 * ptk
+    # боковой отступ между параллельными стрелками (вдоль стены)
+    sep = off * 0.18 * ptk
+
+    if opposite:
+        # ось пары по нормали u0: A на линии, B наружу
+        A = (qx + u0[0] * L * 0.02, qy + u0[1] * L * 0.02)
+        B = (qx + u0[0] * L, qy + u0[1] * L)
+        # стрелка 1: A → B
+        # стрелка 2: параллельно, B' → A' (начало 2 ≈ конец 1, конец 2 ≈ начало 1)
+        A2 = (A[0] + tx * sep, A[1] + ty * sep)
+        B2 = (B[0] + tx * sep, B[1] + ty * sep)
+        ar1 = _arrow_from_segment(A, B, u0)
+        # направление второй — противоположное
+        u_opp = (-u0[0], -u0[1])
+        ar2 = _arrow_from_segment(B2, A2, u_opp)
+        return [ar1, ar2]
+
+    # одинаковое направление — две стрелки рядом в одну сторону
     arrows = []
     for i, r in enumerate(ordered):
         u = offset_dir_row(r, dxf)
-        if n == 1:
-            qi = (qx, qy)
-        else:
-            shift = (i - (n - 1) / 2.0) * spacing
-            qi = (qx + tx * shift, qy + ty * shift)
+        shift = (i - (n - 1) / 2.0) * sep
+        qi = (qx + tx * shift, qy + ty * shift)
         arrows.append(standard_arrow(qi, u, off, ptk))
     return arrows
 
