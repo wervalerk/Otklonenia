@@ -1166,7 +1166,7 @@ def _arrow_from_segment(start, end, u):
     """Стрелка по готовым start/end и направлению u (единичный)."""
     ux, uy = u
     L = math.hypot(end[0] - start[0], end[1] - start[1]) or 1e-6
-    head = L * 0.42
+    head = min(L * 0.14, L * 0.42)  # наконечник умеренный на длинном древке
     wing = head * 0.45
     px, py = -uy, ux
     a1 = (
@@ -1218,7 +1218,7 @@ def _pair_arrows(ordered, dxf, off, ptk):
     u1 = offset_dir_row(ordered[1], dxf)
     opposite = (u0[0] * u1[0] + u0[1] * u1[1]) < 0
 
-    L = off * 0.72 * ptk
+    L = off * 3.60 * ptk   # древко ×5 (было 0.72)
     # боковой отступ между параллельными стрелками (вдоль стены)
     sep = off * 0.18 * ptk
 
@@ -1263,16 +1263,16 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 
 def standard_arrow(q, u, off, ptk):
     """
-    Короткая стрелка как на образцах ИС ВК:
-    от кромки полилинии по нормали в сторону смещения.
-    Не длинная выноска — короткий штрих с наконечником у линии.
+    Стрелка от кромки полилинии по нормали в сторону смещения.
+    Древко ×5 относительно короткой версии (0.72 → 3.60).
     """
-    L = off * 0.72 * ptk          # короткая, как на PDF-образцах
+    L = off * 3.60 * ptk          # древко длиннее в 5 раз
     ux, uy = u
     # старт почти на линии
     start = (q[0] + ux * L * 0.02, q[1] + uy * L * 0.02)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.42               # заметный наконечник на короткой стрелке
+    # наконечник не раздуваем пропорционально всей длине
+    head = min(L * 0.14, off * 0.55 * ptk)
     wing = head * 0.45
     px, py = -uy, ux
     a1 = (
@@ -2153,7 +2153,18 @@ def write_dxf(path, dxf, rows, flags, off, th, txt):
 # ─────────────────── Сцена и тексты ───────────────────
 
 def load_inputs(data: dict):
-    txt = parse_txt(data["txt_path"])
+    tp = data.get("txt_path")
+    dp = data.get("dxf_path")
+    if not tp or not os.path.exists(tp):
+        raise FileNotFoundError(
+            f"TXT не найден (txt_path={tp!r}). Нажмите /start и пришлите файлы заново."
+        )
+    if not dp or not os.path.exists(dp):
+        raise FileNotFoundError(
+            f"DXF не найден (dxf_path={dp!r}). Пришлите DXF или выберите ячейку."
+        )
+
+    txt = parse_txt(tp)
     txt.shift = data.get("shift", txt.shift)
     txt.tol_mm = data.get("tol", txt.tol_mm)
     txt.level_tol = data.get("level_tol", txt.level_tol)
@@ -2170,7 +2181,7 @@ def load_inputs(data: dict):
         ]
 
     dxf = parse_dxf(
-        data["dxf_path"],
+        dp,
         txt.shift,
         txt.dxfunits,
         txt.level_tol,
@@ -2434,11 +2445,15 @@ async def on_txt(msg: types.Message, state: FSMContext):
 
     fname = msg.document.file_name or "points.txt"
     data = await state.get_data()
-    p = os.path.join(data["tmp"], "points.txt")
+    tmp = data.get("tmp")
+    if not tmp or not os.path.isdir(tmp):
+        tmp = tempfile.mkdtemp(prefix=f"tg_{msg.from_user.id}_")
+        await state.update_data(tmp=tmp)
 
-    await download_doc(msg, p)
+    p = os.path.join(tmp, "points.txt")
 
     try:
+        await download_doc(msg, p)
         txt = parse_txt(p)
     except Exception as e:
         await msg.answer(
@@ -2447,10 +2462,18 @@ async def on_txt(msg: types.Message, state: FSMContext):
         )
         return
 
+    if not txt.points:
+        await msg.answer(
+            "В TXT нет точек. Проверьте формат и пришлите снова.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     pt_k = txt.pt_k if txt.pt_set else data.get("pt_k", txt.pt_k)
     hs = [t[3] for t in txt.points]
 
     await state.update_data(
+        tmp=tmp,
         txt_path=p,
         txt_name=fname,
         shift=txt.shift,
@@ -2497,7 +2520,21 @@ async def on_dxf(msg: types.Message, state: FSMContext):
 
     fname = msg.document.file_name or "proj.dxf"
     data = await state.get_data()
-    p = os.path.join(data["tmp"], "proj.dxf")
+    tmp = data.get("tmp")
+    if not tmp or not os.path.isdir(tmp):
+        tmp = tempfile.mkdtemp(prefix=f"tg_{msg.from_user.id}_")
+        await state.update_data(tmp=tmp)
+        data = await state.get_data()
+
+    if not data.get("txt_path") or not os.path.exists(data.get("txt_path", "")):
+        await msg.answer(
+            "Сначала пришлите TXT. Нажмите /start.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await state.set_state(Form.wait_txt)
+        return
+
+    p = os.path.join(tmp, "proj.dxf")
 
     declared = msg.document.file_size
     if declared and declared > DXF_MAX_BYTES:
@@ -2532,6 +2569,7 @@ async def on_dxf(msg: types.Message, state: FSMContext):
         return
 
     await state.update_data(
+        tmp=tmp,
         dxf_path=p,
         dxf_name=fname,
         shift_checked=False,
@@ -2587,8 +2625,13 @@ async def ul_load(c: types.CallbackQuery, state: FSMContext):
     n = int(c.data.split("_")[-1])
     data = await state.get_data()
     tmp = data.get("tmp")
-    if not tmp:
+    if not tmp or not os.path.isdir(tmp):
         await c.answer("Сначала /start", show_alert=True)
+        return
+    tp = data.get("txt_path")
+    if not tp or not os.path.exists(tp):
+        await c.answer("Сначала пришлите TXT", show_alert=True)
+        await state.set_state(Form.wait_txt)
         return
     dest = os.path.join(tmp, "proj.dxf")
     try:
@@ -2598,6 +2641,7 @@ async def ul_load(c: types.CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(
+        tmp=tmp,
         dxf_path=dest,
         dxf_name=f"{name}.dxf",
         shift_checked=False,
