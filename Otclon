@@ -1164,15 +1164,15 @@ def offset_dir(rows_subset, dxf):
 
 def _pair_arrows(ordered, dxf, off, ptk):
     """
-    Стрелки для группы. Для пары В/Н — ДВЕ стрелки рядом на общей базе:
-    каждая в сторону своего смещения (разные знаки → разнонаправленно).
-    Не разъезжаются по разным q — всегда общий центр + малый сдвиг вдоль линии.
+    Стрелки для группы. Для пары В/Н — ДВЕ стрелки РЯДОМ на одной базе
+    (как на образцах ИС ВК): не разъезжаются по разным q.
+    Разные знаки dp → разнонаправленные, но из почти одной точки на линии.
     """
     n = len(ordered)
     if n == 0:
         return []
 
-    # касательная к сегменту — стрелки ставим рядом вдоль линии
+    # касательная к сегменту — лёгкий сдвиг вдоль линии
     s = _safe_segment(dxf, ordered[0])
     if s is not None:
         ex, ey = s.bx - s.ax, s.by - s.ay
@@ -1181,12 +1181,19 @@ def _pair_arrows(ordered, dxf, off, ptk):
     else:
         tx, ty = 1.0, 0.0
 
-    # одна общая база (не уезжаем к разным q точек)
-    qx = sum(r["q"][0] for r in ordered) / n
-    qy = sum(r["q"][1] for r in ordered) / n
+    # строго одна общая база (середина проекций)
+    qx = sum(float(r["q"][0]) for r in ordered) / n
+    qy = sum(float(r["q"][1]) for r in ordered) / n
 
-    # расстояние между соседними стрелками (×1.2 к прежнему 0.40)
-    spacing = off * 0.48 * ptk
+    # разнонаправленные? — ещё плотнее, почти одна точка
+    if n >= 2:
+        signs = [1 if float(r.get("dp", 0.0) or 0.0) >= 0 else -1 for r in ordered]
+        opposite = signs[0] != signs[1]
+    else:
+        opposite = False
+
+    # на образцах пара сидит вплотную; при противоположных знаках — почти 0
+    spacing = off * (0.12 if opposite else 0.20) * ptk
 
     arrows = []
     for i, r in enumerate(ordered):
@@ -1194,7 +1201,6 @@ def _pair_arrows(ordered, dxf, off, ptk):
         if n == 1:
             qi = (qx, qy)
         else:
-            # симметрично от общего центра — пара всегда рядом
             shift = (i - (n - 1) / 2.0) * spacing
             qi = (qx + tx * shift, qy + ty * shift)
         arrows.append(standard_arrow(qi, u, off, ptk))
@@ -1218,15 +1224,17 @@ def text_angle(rows_subset, dxf, u=None) -> float:
 
 def standard_arrow(q, u, off, ptk):
     """
-    Стрелка строго по нормали: от полилинии в сторону смещения.
-    Длина ×2 относительно предыдущей версии (было 1.40 → 2.80).
+    Короткая стрелка как на образцах ИС ВК:
+    от кромки полилинии по нормали в сторону смещения.
+    Не длинная выноска — короткий штрих с наконечником у линии.
     """
-    L = off * 2.80 * ptk
+    L = off * 0.72 * ptk          # короткая, как на PDF-образцах
     ux, uy = u
-    start = (q[0] + ux * L * 0.03, q[1] + uy * L * 0.03)
+    # старт почти на линии
+    start = (q[0] + ux * L * 0.02, q[1] + uy * L * 0.02)
     end = (q[0] + ux * L, q[1] + uy * L)
-    head = L * 0.28
-    wing = head * 0.38
+    head = L * 0.42               # заметный наконечник на короткой стрелке
+    wing = head * 0.45
     px, py = -uy, ux
     a1 = (
         end[0] - ux * head + px * wing,
