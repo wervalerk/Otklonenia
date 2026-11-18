@@ -996,45 +996,15 @@ def parse_dxf(path, shift, dxfunits_override, level_tol) -> DxfData:
 
 def compute(txt: TxtData, dxf: DxfData):
     """
-    Плановые отклонения от полилиний DXF.
-
-    Особый режим для отверстий (как на образцах ИГС):
-    - если точка лежит внутри отверстия или ближе 0.9 м к его контуру,
-      проекция выполняется ТОЛЬКО на сегменты этого отверстия;
-    - иначе — на все сегменты (внешний контур + остальное).
-    Это не даёт точкам с края лестничной клетки «прилипать» к дальнему
-    наружному контуру плиты.
+    Плановые отклонения от ближайшей линии DXF.
+    Для каждой точки: проекция на ближайший сегмент любой полилинии,
+    dp = знаковая дистанция (мм) от точки до этой линии.
     """
-    OPENING_NEAR_M = 0.90  # м — порог «принадлежит отверстию»
-
     rows = []
     for pid, x, y, h in txt.points:
-        # 1) Определяем, к какому отверстию (если к какому-то) относится точка
-        preferred_si: Optional[set] = None
-        opening_id = None
-        if dxf.openings:
-            best_op = None
-            best_d = OPENING_NEAR_M + 1.0
-            for oi, op in enumerate(dxf.openings):
-                d_edge = _dist_to_poly(x, y, op["pts"])
-                inside = _point_in_poly(x, y, op["pts"])
-                # внутри отверстия или очень близко к его границе
-                if inside or d_edge <= OPENING_NEAR_M:
-                    score = 0.0 if inside else d_edge
-                    if score < best_d:
-                        best_d = score
-                        best_op = oi
-            if best_op is not None:
-                preferred_si = set(dxf.openings[best_op]["seg_idx"])
-                opening_id = best_op
-
         same, other = [], []
 
         for si, s in enumerate(dxf.segments):
-            # если точка «от отверстия» — смотрим только его сегменты
-            if preferred_si is not None and si not in preferred_si:
-                continue
-
             vx, vy = s.bx - s.ax, s.by - s.ay
             L2 = vx * vx + vy * vy
             if L2 < 1e-18:
@@ -1058,41 +1028,36 @@ def compute(txt: TxtData, dxf: DxfData):
                 "layer": s.layer,
                 "si": si,
             }
-
             if not dxf.has_z or c["dz"] <= txt.level_tol:
                 same.append(c)
             else:
                 other.append(c)
 
-        # если по отверстию ничего не нашли (редкий случай) — fallback на все
-        if preferred_si is not None and not (same or other):
-            preferred_si = None
-            for si, s in enumerate(dxf.segments):
-                vx, vy = s.bx - s.ax, s.by - s.ay
-                L2 = vx * vx + vy * vy
-                if L2 < 1e-18:
-                    continue
-                t = ((x - s.ax) * vx + (y - s.ay) * vy) / L2
-                t = 0.0 if t < 0 else (1.0 if t > 1 else t)
-                qx, qy = s.ax + t * vx, s.ay + t * vy
-                qz = s.az + t * (s.bz - s.az)
-                d = math.hypot(x - qx, y - qy)
-                cross = vx * (y - s.ay) - vy * (x - s.ax)
-                dp = (1.0 if cross >= 0 else -1.0) * d * 1000.0
-                c = {
-                    "d": d, "dp": dp, "qx": qx, "qy": qy, "qz": qz,
-                    "dz": abs(qz - h), "layer": s.layer, "si": si,
-                }
-                if not dxf.has_z or c["dz"] <= txt.level_tol:
-                    same.append(c)
-                else:
-                    other.append(c)
-
         if not same and other:
             zmin = min(c["dz"] for c in other)
             same = [c for c in other if c["dz"] <= zmin + txt.level_tol]
 
-        best = min(same or other, key=lambda c: c["d"])
+        pool = same or other
+        if not pool:
+            rows.append({
+                "pid": pid,
+                "p": (x, y),
+                "q": (x, y),
+                "h": h,
+                "qz": h,
+                "dz": 0.0,
+                "d_m": 0.0,
+                "dp": 0.0,
+                "layer": "0",
+                "si": -1,
+                "over": False,
+                "opening_id": None,
+                "mismatch": False,
+            })
+            continue
+
+        # строго ближайший сегмент
+        best = min(pool, key=lambda c: c["d"])
         dp = 0.0 if abs(best["dp"]) < 0.5 else best["dp"]
 
         rows.append({
@@ -1107,14 +1072,11 @@ def compute(txt: TxtData, dxf: DxfData):
             "layer": best["layer"],
             "si": best["si"],
             "over": abs(dp) > txt.tol_mm,
-            "opening_id": opening_id,          # None или индекс отверстия
+            "opening_id": None,
             "mismatch": bool(
                 dxf.has_z
                 and other
-                and not any(
-                    c["dz"] <= txt.level_tol
-                    for c in (same + other)
-                )
+                and not any(c["dz"] <= txt.level_tol for c in (same + other))
             ),
         })
     return rows
