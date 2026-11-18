@@ -44,8 +44,8 @@ SHIFT_M = 50.0
 DXF_MAX_MB = 30
 DXF_MAX_BYTES = DXF_MAX_MB * 1024 * 1024  # 31 457 280 байт
 
-# ─── 4 ячейки подложек (DXF) на диске ───
-UNDERLAY_DIR = Path("/home/workdir/artifacts/underlays")
+# ─── 4 ячейки подложек (DXF) рядом со скриптом ───
+UNDERLAY_DIR = Path(__file__).resolve().parent / "underlays"
 UNDERLAY_DIR.mkdir(parents=True, exist_ok=True)
 UNDERLAY_META = UNDERLAY_DIR / "slots.json"
 UNDERLAY_SLOTS = (1, 2, 3, 4)
